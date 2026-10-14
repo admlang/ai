@@ -23,7 +23,7 @@ The clients share one shape, so a program can move between a provider and a loca
 
 - a `Client` made from an API key (a `Secret<string>`, or the provider's usual environment
   variable when none is given) and an optional base URL;
-- `chat` takes `std.ai.llm` messages and tool declarations and returns a reply, or streams it
+- `chat` takes a prompt or a list of `std.ai.llm` messages, and tool declarations and returns a reply, or streams it
   as the tokens arrive; tool calls come back typed and the answers go in as messages;
 - `embed` returns vectors as `float[]`;
 - every failure is one error type per library with a `kind` (`Auth`, `RateLimited`,
@@ -34,11 +34,6 @@ The clients share one shape, so a program can move between a provider and a loca
 
 What is specific to a provider (reasoning effort, prompt caching, grounding, safety settings)
 is a typed option of that library, never a string the program has to know.
-
-## Status
-
-Nothing is built yet. Each library is declared so that its name and scope are fixed, and its
-README is the design the code will follow.
 
 ## Tests
 
