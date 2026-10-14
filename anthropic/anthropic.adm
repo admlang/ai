@@ -1,0 +1,3 @@
+partial module adm.ai.anthropic {
+	// Anthropic Messages API over std.net.http: chat with tool use, streaming, extended thinking, prompt caching, token counting, files, message batches
+}

@@ -1,0 +1,11 @@
+// Anthropic Claude API client
+@manifest(version = "0.0.1")
+library adm.ai.anthropic {
+	use (
+		adm.ai.anthropic
+	)
+
+	export (
+		adm.ai.anthropic
+	)
+}

@@ -1,0 +1,11 @@
+// Ollama API client
+@manifest(version = "0.0.1")
+library adm.ai.ollama {
+	use (
+		adm.ai.ollama
+	)
+
+	export (
+		adm.ai.ollama
+	)
+}

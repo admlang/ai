@@ -1,0 +1,3 @@
+partial module adm.ai.openai {
+	// OpenAI API over std.net.http: responses and chat completions with tools and streaming, embeddings, images, audio, files, batches; baseURL for compatible servers (OpenRouter, Groq, Mistral, DeepSeek, Together, vLLM, LM Studio)
+}

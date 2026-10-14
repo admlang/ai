@@ -1,0 +1,11 @@
+// Google Gemini API client
+@manifest(version = "0.0.1")
+library adm.ai.gemini {
+	use (
+		adm.ai.gemini
+	)
+
+	export (
+		adm.ai.gemini
+	)
+}

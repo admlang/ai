@@ -1,0 +1,3 @@
+partial module adm.ai.ollama {
+	// Ollama native API over std.net.http: chat and generate with streaming, embeddings, model management (pull, list, show, create, delete), keep-alive
+}

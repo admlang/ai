@@ -1,0 +1,3 @@
+partial module adm.ai.gemini {
+	// Gemini API over std.net.http: generateContent and streaming, function calling, embeddings, files, context caching, grounding
+}

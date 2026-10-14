@@ -1,0 +1,11 @@
+// OpenAI API client, also for OpenAI-compatible servers
+@manifest(version = "0.0.1")
+library adm.ai.openai {
+	use (
+		adm.ai.openai
+	)
+
+	export (
+		adm.ai.openai
+	)
+}
