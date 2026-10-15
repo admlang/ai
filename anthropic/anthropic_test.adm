@@ -1,11 +1,13 @@
 partial module adm.ai.anthropic {
 	use (
+		std.os
 		std.testing
 		std.net.http
 		std.net.http.httptest
 		std.data.encoding::(JSON)
 		std.formats.docs::(Document)
 		std.formats.audio::(Audio)
+		std.formats.image::(Image)
 		std.ai.llm
 		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, StopReason, ChatRequest, tool)
 	)
@@ -41,10 +43,29 @@ partial module adm.ai.anthropic {
 		}
 	}
 
+	// A screen of 4 × 4 pixels that records the actions it is asked for.
+	internal type FakeScreen {
+		done string[]
+
+		def screenshot() !Image {
+			return new Image(4, 4)
+		}
+
+		def act(action ComputerAction) !string {
+			done.push("{action.action} {action.x},{action.y}")
+			return ""
+		}
+	}
+
 	internal type Seen {
 		bodies  map<string, any>[]
 		headers string[]
 		forms   string[]
+	}
+
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
 	}
 
 	internal def event(name string, data string) string {
@@ -71,6 +92,57 @@ partial module adm.ai.anthropic {
 			let model = "{body.get("model")}"
 			return ctx.text(529, "\{\"type\":\"error\",\"error\":\{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}") when model == "busy"
 			return ctx.text(event("message_start", "\{\"type\":\"message_start\",\"message\":\{\"usage\":\{\"input_tokens\":3}}}") + event("error", "\{\"type\":\"error\",\"error\":\{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}")) when model == "breaks"
+			if model == "summarizer" && body.hasKey("compaction") {
+				return ctx.text("\{\"content\":[\{\"type\":\"compaction\",\"content\":\"Ada asked about Oslo.\",\"signature\":\"S1\"}],\"stop_reason\":\"compaction\",\"usage\":\{\"input_tokens\":0,\"output_tokens\":0}}")
+			}
+			if model == "computer" {
+				let list = body.get("messages")
+				let turns = list is any[] ?? (list.len(), 0)
+				let reply = event("message_start", "\{\"type\":\"message_start\",\"message\":\{\"usage\":\{\"input_tokens\":4,\"output_tokens\":1}}}")
+				let call = turns == 1 ?? ("\{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"left_click\",\"toolset_name\":\"computer\",\"input\":\{}}", "\{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"screenshot\",\"toolset_name\":\"computer\",\"input\":\{}}")
+				if turns >= 5 {
+					reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":\{\"type\":\"text\",\"text\":\"\"}}")
+					reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"text_delta\",\"text\":\"Saved.\"}}")
+					reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":0}")
+					reply += event("message_delta", "\{\"type\":\"message_delta\",\"delta\":\{\"stop_reason\":\"end_turn\"},\"usage\":\{\"output_tokens\":2}}")
+					return ctx.text(reply + event("message_stop", "\{\"type\":\"message_stop\"}"))
+				}
+				reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{call}}")
+				let input = turns == 1 ?? ("\{\\\"coordinate\\\":[12,34]}", "\{}")
+				reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"input_json_delta\",\"partial_json\":\"{input}\"}}")
+				reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":0}")
+				reply += event("message_delta", "\{\"type\":\"message_delta\",\"delta\":\{\"stop_reason\":\"tool_use\"},\"usage\":\{\"output_tokens\":2}}")
+				return ctx.text(reply + event("message_stop", "\{\"type\":\"message_stop\"}"))
+			}
+			if model == "searcher" {
+				let list = body.get("messages")
+				let last = list is any[] && list.len() > 0 ?? (list[list.len() - 1], none)
+				let resumed = last is map<string, any> && "{last.get("role")}" == "assistant"
+				let reply = event("message_start", "\{\"type\":\"message_start\",\"message\":\{\"id\":\"msg_s\",\"usage\":\{\"input_tokens\":10,\"output_tokens\":1}}}")
+				if resumed {
+					reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":\{\"type\":\"text\",\"text\":\"\"}}")
+					reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"text_delta\",\"text\":\" Done.\"}}")
+					reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":0}")
+					reply += event("message_delta", "\{\"type\":\"message_delta\",\"delta\":\{\"stop_reason\":\"end_turn\"},\"usage\":\{\"output_tokens\":3},\"context_management\":\{\"applied_edits\":[\{\"type\":\"clear_tool_uses_20250919\",\"cleared_tool_uses\":2,\"cleared_input_tokens\":900}]}}")
+					return ctx.text(reply + event("message_stop", "\{\"type\":\"message_stop\"}"))
+				}
+				reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":\{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}")
+				reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"input_json_delta\",\"partial_json\":\"\{\\\"query\\\":\\\"oslo population\\\"}\"}}")
+				reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":0}")
+				reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":1,\"content_block\":\{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[\{\"type\":\"web_search_result\",\"url\":\"https://oslo.example\",\"title\":\"Oslo\",\"encrypted_content\":\"E1\"}]}}")
+				reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":1}")
+				reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":2,\"content_block\":\{\"type\":\"text\",\"text\":\"\"}}")
+				reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":2,\"delta\":\{\"type\":\"text_delta\",\"text\":\"Oslo has 700 000 people.\"}}")
+				reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":2,\"delta\":\{\"type\":\"citations_delta\",\"citation\":\{\"type\":\"web_search_result_location\",\"url\":\"https://oslo.example\",\"title\":\"Oslo\",\"encrypted_index\":\"I1\",\"cited_text\":\"700 000 inhabitants\"}}}")
+				reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":2}")
+				reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":3,\"content_block\":\{\"type\":\"server_tool_use\",\"id\":\"srv_2\",\"name\":\"bash_code_execution\"}}")
+				reply += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":3,\"delta\":\{\"type\":\"input_json_delta\",\"partial_json\":\"\{\\\"command\\\":\\\"ls\\\"}\"}}")
+				reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":3}")
+				reply += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":4,\"content_block\":\{\"type\":\"bash_code_execution_tool_result\",\"tool_use_id\":\"srv_2\",\"content\":\{\"type\":\"bash_code_execution_result\",\"stdout\":\"a.csv\\n\",\"stderr\":\"\",\"return_code\":0,\"content\":[\{\"type\":\"bash_code_execution_output\",\"file_id\":\"file_9\"}]}}}")
+				reply += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":4}")
+				reply += event("message_delta", "\{\"type\":\"message_delta\",\"delta\":\{\"stop_reason\":\"pause_turn\",\"container\":\{\"id\":\"cont_1\",\"expires_at\":\"2026-11-14T00:00:00Z\"}},\"usage\":\{\"output_tokens\":20}}")
+				return ctx.text(reply + event("message_stop", "\{\"type\":\"message_stop\"}"))
+			}
 			let messages = body.get("messages")
 			let answered = false
 			if messages is any[] {
@@ -224,6 +296,128 @@ partial module adm.ai.anthropic {
 			fail "no results" unless answers is any[]
 			assert answers.len() == 2 && "{results["role"]}" == "user"
 			try server.close()
+			return none
+		}
+
+		// Server tools: a search with its citation, a command code
+		// execution ran (shown as text), the turn paused and resumed in the
+		// same reply, the container kept, context editing and compaction.
+		@test()
+		def TestServerToolsAndCompaction() !none {
+			let seen = new Seen()
+			let server = try claudeServer(seen)
+			let ai = new Client(model = "searcher", apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			ai.refusalFallback = false
+			ai.webSearch = WebSearch{maxUses: 2, location: Location{country: "NO"}}
+			ai.webFetch = WebFetch{}
+			ai.codeExecution = true
+			ai.clearToolUses = ClearToolUses{atTokens: 50000}
+			ai.clearThinking = ClearThinking{keep: 2}
+			ai.compactAt = 60000
+			let chat = ai.chat()
+			let reply = try chat.say("How many people live in Oslo?")
+			assert reply == "Oslo has 700 000 people.\n```bash\nls\n```\n\n```\na.csv\n```\n Done." && seen.bodies.len() == 2
+			let answer = chat.messages()[1]
+			let cites = citationsOf(answer)
+			assert cites.len() == 1 && cites[0].kind == CitationKind.WebPage && cites[0].url == "https://oslo.example" && cites[0].text == "700 000 inhabitants" && cites[0].claim == "Oslo has 700 000 people."
+			let runs = serverToolsOf(answer)
+			assert runs.len() == 2 && runs[0].tool == "web_search" && runs[0].input == "\{\"query\":\"oslo population\"}" && runs[0].output.contains("oslo.example") && runs[1].tool == "bash_code_execution"
+			assert containerOf(answer) == "cont_1" && outputFilesOf(answer)[0].id == "file_9" && editsOf(answer).len() == 1
+			assert chat.usage().inputTokens == 20 && chat.usage().outputTokens == 23
+
+			let first = seen.bodies[0]
+			let tools = first["tools"]
+			fail "no tools" unless tools is any[] && tools.len() == 3
+			let search = tools[0]
+			let fetch = tools[1]
+			let code = tools[2]
+			fail "not objects" unless search is map<string, any> && fetch is map<string, any> && code is map<string, any>
+			assert "{search["type"]}" == "web_search_20250305" && "{search["max_uses"]}" == "2" && json(search["user_location"]).contains("\"NO\"")
+			assert "{fetch["type"]}" == "web_fetch_20250910" && "{code["type"]}" == "code_execution_20250825"
+			let managed = first["context_management"]
+			fail "no context management" unless managed is map<string, any>
+			let edits = managed["edits"]
+			fail "no edits" unless edits is any[] && edits.len() == 3
+			assert json(edits[0]).contains("clear_thinking_20251015") && json(edits[1]).contains("clear_tool_uses_20250919") && json(edits[2]).contains("compact_20260112")
+			assert seen.headers[0] == "k|2023-06-01|context-management-2025-06-27,compact-2026-01-12"
+			// The resumed request: the paused turn's blocks back as they came,
+			// in the container.
+			let second = seen.bodies[1]
+			let messages = second["messages"]
+			fail "no messages" unless messages is any[] && messages.len() == 2
+			let paused = messages[1]
+			fail "no paused turn" unless paused is map<string, any>
+			let blocks = paused["content"]
+			fail "no blocks" unless blocks is any[] && blocks.len() == 5
+			assert "{second["container"]}" == "cont_1" && json(blocks[1]).contains("E1")
+
+			// On-demand compaction: the block alone, first in later requests.
+			chat.model = "summarizer"
+			try ai.compact(chat)
+			let after = chat.messages()
+			assert after.len() == 1 && after[0].text == "Ada asked about Oslo."
+			assert seen.headers[2].contains("compact-2026-09-04") && !seen.bodies[2].hasKey("context_management")
+			chat.model = "searcher"
+			try chat.say("And Bergen?")
+			let next = seen.bodies[3]["messages"]
+			fail "no messages" unless next is any[]
+			let opening = next[0]
+			fail "no block first" unless opening is map<string, any>
+			assert json(opening["content"]).contains("\"signature\":\"S1\"") && seen.headers[3].contains("compact-2026-09-04")
+			try server.close()
+			return none
+		}
+
+		// Computer use: the toolset declared once, the actions run on the
+		// program's screen, a screenshot sent back as a picture, every result
+		// naming the toolset.
+		@test()
+		def TestComputerUse() !none {
+			let seen = new Seen()
+			let server = try claudeServer(seen)
+			let ai = new Client(model = "computer", apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			let screen = new FakeScreen()
+			ai.computer = screen
+			let chat = ai.chat()
+			assert (try chat.say("Save the file.")) == "Saved." && screen.done.equals(string["left_click 12,34"])
+			assert json(seen.bodies[0]["tools"]) == "[\{\"type\":\"computer_toolset_20260801\"}]"
+			let last = seen.bodies[2]["messages"]
+			fail "no messages" unless last is any[] && last.len() == 5
+			let results = json(last[4])
+			assert results.contains("\"toolset_name\":\"computer\"") && results.contains("\"type\":\"image\"") && results.contains("image/png")
+			assert json(last[2]).contains("\"content\":\"OK\"")
+			try server.close()
+			return none
+		}
+
+		// The memory tool over a folder: Anthropic's commands, its result
+		// texts, and no path outside /memories.
+		@test()
+		def TestMemoryTool() !none {
+			let folder = os.join(try os.appHome(), "memories")
+			let run = def (json string) !string {
+				let c = MemoryCommand{command: ""}
+				try (new JSON()).decode(json, c)
+				return try runMemory(folder, c)
+			}
+			assert (try run("\{\"command\":\"view\",\"path\":\"/memories\"}")).startsWith("Here're the files and directories up to 2 levels deep in /memories")
+			assert (try run("\{\"command\":\"create\",\"path\":\"/memories/notes.txt\",\"file_text\":\"one\\ntwo\\n\"}")) == "File created successfully at: /memories/notes.txt"
+			assert (try run("\{\"command\":\"view\",\"path\":\"/memories/notes.txt\"}")) == "Here's the content of /memories/notes.txt with line numbers:\n     1\tone\n     2\ttwo"
+			assert (try run("\{\"command\":\"str_replace\",\"path\":\"/memories/notes.txt\",\"old_str\":\"two\",\"new_str\":\"2\"}")) == "The memory file has been edited."
+			assert (try run("\{\"command\":\"insert\",\"path\":\"/memories/notes.txt\",\"insert_line\":0,\"insert_text\":\"zero\\n\"}")) == "The file /memories/notes.txt has been edited."
+			assert (try run("\{\"command\":\"view\",\"path\":\"/memories/notes.txt\",\"view_range\":[1,2]}")).endsWith("     1\tzero\n     2\tone")
+			assert (try run("\{\"command\":\"view\",\"path\":\"/memories\"}")).contains("/memories/notes.txt")
+			assert (try run("\{\"command\":\"rename\",\"old_path\":\"/memories/notes.txt\",\"new_path\":\"/memories/a/b.txt\"}")) == "Successfully renamed /memories/notes.txt to /memories/a/b.txt"
+			assert (try run("\{\"command\":\"delete\",\"path\":\"/memories/a\"}")) == "Successfully deleted /memories/a"
+			try testing.expectError(run("\{\"command\":\"view\",\"path\":\"/memories/../secret\"}"))
+			try testing.expectError(run("\{\"command\":\"view\",\"path\":\"/etc/passwd\"}"))
+			try testing.expectError(run("\{\"command\":\"delete\",\"path\":\"/memories\"}"))
+			// A client with a memory folder offers Anthropic's own tool.
+			let ai = new Client(model = "m", apiKey = "k", baseURL = "http://127.0.0.1:1/v1")
+			ai.memory = folder
+			let chat = ai.chat()
+			let body = try messagesBody(ai, ChatRequest{model: "m", messages: [Message{role: Role.User, text: "hi"}], tools: chat.tools})
+			assert json(body["tools"]) == "[\{\"type\":\"memory_20250818\",\"name\":\"memory\"}]"
 			return none
 		}
 

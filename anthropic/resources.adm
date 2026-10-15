@@ -96,7 +96,7 @@ partial module adm.ai.anthropic {
 			body.delete("max_tokens")
 			body.delete("fallbacks")
 			body.delete("cache_control")
-			let reply = try objectOf(try post(self, "/messages/count_tokens", body, betas))
+			let reply = try objectOf(try post(self, "/messages/count_tokens", body, betasOf(self, body)))
 			return intAt(reply, "input_tokens")
 		}
 
@@ -207,12 +207,16 @@ partial module adm.ai.anthropic {
 		// `reply` for a request it cannot take.
 		def create(requests BatchRequest[]) !Batch {
 			let list any[] = []
+			let betas string[]
 			for let (_, r) in requests {
 				let params = try messagesBody(client, r.request)
 				params.delete("fallbacks")
+				for let (_, b) in betasOf(client, params) {
+					betas.push(b) unless betas.includes(b)
+				}
 				list.push(map<string, any>{"custom_id": r.id, "params": params})
 			}
-			return batchOf(try objectOf(try post(client, "/messages/batches", map<string, any>{"requests": list}, client.betas)))
+			return batchOf(try objectOf(try post(client, "/messages/batches", map<string, any>{"requests": list}, betas)))
 		}
 
 		// The batch `id`, as it is now.

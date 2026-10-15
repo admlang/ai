@@ -8,12 +8,21 @@ partial module adm.ai.openai {
 		std.ai.llm::(ChatRequest, ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, Message, Role, ToolCall, schemaOf, withDocuments)
 	)
 
+	// What starts the token probabilities of a Chat Completions reply kept
+	// in `Message.providerState`.
+	const completionsState = "openai-completions "
+
 	// The body of /chat/completions for `request`.
 	internal def completionsBody(client Client, request ChatRequest) !map<string, any> {
 		let messages any[] = []
 		messages.push(map<string, any>{"role": "system", "content": request.system}) when request.system.len() > 0
 		for let (_, m) in request.messages {
 			messages.push(try completionMessage(m))
+			if m.role == Role.Tool && m.images.len() > 0 {
+				// A tool message holds text alone: its pictures follow in a
+				// user message.
+				messages.push(try completionMessage(Message{role: Role.User, text: "The pictures the tool returned.", images: m.images}))
+			}
 		}
 		let body = map<string, any>{"model": request.model, "messages": messages, "stream": true, "stream_options": map<string, any>{"include_usage": true}}
 		body.set(client.baseURL == openaiURL ?? ("max_completion_tokens", "max_tokens"), request.limit) when request.limit > 0
@@ -38,6 +47,8 @@ partial module adm.ai.openai {
 		}
 		let effort = effortOf(client, request)
 		body.set("reasoning_effort", effort) unless effort is none
+		body.set("logprobs", true) when client.logprobs
+		body.set("top_logprobs", client.topLogprobs) when client.logprobs && client.topLogprobs > 0
 		let verbosity = client.verbosity
 		body.set("verbosity", verbosity.value) unless verbosity is none
 		let schema = request.schema
@@ -52,6 +63,7 @@ partial module adm.ai.openai {
 	// One message of /chat/completions: text alone as a string, with
 	// pictures or sound as parts.
 	internal def completionMessage(m Message) !map<string, any> {
+		fail RemoteError{message: "openai: Chat Completions takes no video", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.videos.len() > 0
 		let shown = withDocuments(m)
 		match m.role {
 			case Role.System:
@@ -113,6 +125,7 @@ partial module adm.ai.openai {
 		internal calls    PartialCall[]
 		internal finished string
 		internal used     Usage
+		internal probs    any[]
 
 		def new(res http.Response) {
 			self.res = res
@@ -185,6 +198,7 @@ partial module adm.ai.openai {
 					calls[at].name += textAt(function, "name")
 					calls[at].arguments += textAt(function, "arguments")
 				}
+				probs.push(...listAt(objectAt(choice, "logprobs"), "content"))
 				let reason = textAt(choice, "finish_reason")
 				finished = reason when reason.len() > 0 && finished != "refusal"
 			}
@@ -197,7 +211,8 @@ partial module adm.ai.openai {
 				pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(c.id.len() > 0 ?? (c.id, "call_{k + 1}"), c.name, c.arguments)})
 			}
 			let stop = finished == "length" ?? (StopReason.Limit, finished == "content_filter" || finished == "refusal" ?? (StopReason.Filtered, calls.len() > 0 ?? (StopReason.Calls, StopReason.End)))
-			pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: used})
+			let state = probs.len() > 0 ?? (completionsState + string((new JSON()).encode(map<string, any>{"logprobs": probs})), "")
+			pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: used, state: state})
 			close()
 		}
 	}

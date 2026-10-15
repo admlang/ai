@@ -24,16 +24,22 @@ partial module adm.ai.openai {
 		for let (_, m) in request.messages {
 			try addItems(input, m, refuse)
 		}
-		let body = map<string, any>{"model": request.model, "input": input, "stream": true, "store": false, "include": ["reasoning.encrypted_content"]}
+		let include = any["reasoning.encrypted_content"]
+		include.push("message.output_text.logprobs") when client.logprobs
+		include.push("code_interpreter_call.outputs") unless client.codeInterpreter is none
+		include.push("web_search_call.action.sources") unless client.webSearch is none
+		include.push("file_search_call.results") unless client.fileSearch is none
+		let body = map<string, any>{"model": request.model, "input": input, "stream": true, "store": false, "include": include}
+		body.set("top_logprobs", client.topLogprobs) when client.logprobs && client.topLogprobs > 0
 		body.set("instructions", request.system) when request.system.len() > 0
 		body.set("max_output_tokens", request.limit) when request.limit > 0
 		body.set("temperature", request.temperature) unless request.temperature is none
 		body.set("top_p", request.topP) unless request.topP is none
-		if request.tools.len() > 0 {
-			let tools any[] = []
-			for let (_, t) in request.tools {
-				tools.push(map<string, any>{"type": "function", "name": t.name, "description": t.description, "parameters": schemaOf(t), "strict": false})
-			}
+		let tools = try hostedTools(client)
+		for let (_, t) in request.tools {
+			tools.push(map<string, any>{"type": "function", "name": t.name, "description": t.description, "parameters": schemaOf(t), "strict": false})
+		}
+		if tools.len() > 0 {
 			body.set("tools", tools)
 			body.set("parallel_tool_calls", client.parallelToolCalls)
 		}
@@ -62,6 +68,7 @@ partial module adm.ai.openai {
 	// The input items of one message.
 	internal def addItems(input any[], m Message, refuse def (what string) !none) !none {
 		try refuse("sound") when m.audio.len() > 0
+		fail RemoteError{message: "openai: OpenAI's APIs take no video", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.videos.len() > 0
 		let shown = withDocuments(m)
 		match m.role {
 			case Role.System:
@@ -77,23 +84,28 @@ partial module adm.ai.openai {
 				}
 				input.push(map<string, any>{"role": "user", "content": parts})
 			case Role.Assistant:
-				input.push(...reasoningItems(m.providerState))
+				// The reply's items as the API gave them (reasoning, hosted tool
+				// calls), its text and calls rebuilt.
+				for let (_, item) in itemsOf(m) {
+					input.push(item) unless item is map<string, any> && (textAt(item, "type") := "message" || "function_call")
+				}
 				input.push(map<string, any>{"type": "message", "role": "assistant", "content": [map<string, any>{"type": "output_text", "text": shown.text}]}) when shown.text.len() > 0
 				for let (_, c) in m.calls {
 					input.push(map<string, any>{"type": "function_call", "call_id": c.id, "name": c.name, "arguments": c.arguments.len() > 0 ?? (c.arguments, "\{}")})
 				}
 			case Role.Tool:
-				input.push(map<string, any>{"type": "function_call_output", "call_id": m.callId, "output": shown.text})
+				if m.images.len() == 0 {
+					input.push(map<string, any>{"type": "function_call_output", "call_id": m.callId, "output": shown.text})
+				} else {
+					let parts any[] = []
+					parts.push(map<string, any>{"type": "input_text", "text": shown.text}) when shown.text.len() > 0
+					for let (_, picture) in m.images {
+						parts.push(map<string, any>{"type": "input_image", "image_url": try imageURL(picture), "detail": "auto"})
+					}
+					input.push(map<string, any>{"type": "function_call_output", "call_id": m.callId, "output": parts})
+				}
 		}
 		return none
-	}
-
-	// The reasoning items a Responses reply left in its message's state;
-	// none for a state of another provider.
-	internal def reasoningItems(state string) any[] {
-		return any[] unless state.startsWith(responsesState)
-		let parsed = (new JSON()).parse(state.slice(responsesState.len())) onerror recover none
-		return parsed is any[] ?? (parsed, any[])
 	}
 
 	// The reply of /responses as it streams (server-sent events).
@@ -105,7 +117,7 @@ partial module adm.ai.openai {
 		internal ended     bool
 		internal calls     int
 		internal refused   bool
-		internal reasoning any[]
+		internal items     any[]
 		internal summaries int
 
 		def new(res http.Response) {
@@ -165,14 +177,21 @@ partial module adm.ai.openai {
 						calls++
 						let id = textAt(item, "call_id")
 						pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(id.len() > 0 ?? (id, "call_{calls}"), textAt(item, "name"), textAt(item, "arguments"))})
-					} else if kind == "reasoning" {
-						reasoning.push(item)
+					} else {
+						items.push(item)
+						if kind == "code_interpreter_call" {
+							pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "\n```python\n{textAt(item, "code")}\n```\n"})
+							for let (_, o) in listAt(item, "outputs") {
+								let logs = o is map<string, any> ?? (textAt(o, "logs"), "")
+								pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "```\n{logs.trimEnd("\n")}\n```\n"}) when logs.len() > 0
+							}
+						}
 					}
 				case "response.completed", "response.incomplete":
 					let response = objectAt(parsed, "response")
 					let reason = textAt(objectAt(response, "incomplete_details"), "reason")
 					let stop = reason == "max_output_tokens" ?? (StopReason.Limit, reason == "content_filter" || refused ?? (StopReason.Filtered, calls > 0 ?? (StopReason.Calls, StopReason.End)))
-					let state = reasoning.len() > 0 ?? (responsesState + string((new JSON()).encode(reasoning)), "")
+					let state = items.len() > 0 ?? (responsesState + string((new JSON()).encode(map<string, any>{"items": items})), "")
 					pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: responsesUsage(objectAt(response, "usage")), state: state})
 					close()
 				case "response.failed":

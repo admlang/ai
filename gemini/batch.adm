@@ -1,0 +1,137 @@
+partial module adm.ai.gemini {
+	use (
+		std.time
+		std.net.http
+		std.ai.llm::(ChatRequest, RemoteError, RemoteErrorKind, Message, Usage, StopReason)
+	)
+
+	// One request of a batch: its own id and the conversation to answer.
+	struct BatchRequest {
+		id      string
+		request ChatRequest
+	}
+
+	// A batch of requests answered within a day at half the price.
+	struct Batch {
+		// "batches/abc".
+		id      string
+		// "BATCH_STATE_PENDING", "BATCH_STATE_RUNNING",
+		// "BATCH_STATE_SUCCEEDED", "BATCH_STATE_FAILED",
+		// "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED".
+		status  string
+		model   string
+		created ?time.Time
+		ended   ?time.Time
+	}
+
+	// How one request of a batch ended.
+	enum BatchOutcome {
+		Succeeded,
+		Errored,
+	}
+
+	// The answer to one request of a batch.
+	struct BatchResult {
+		id      string
+		outcome BatchOutcome
+		// The reply, when it succeeded: text, thinking, calls, and its parts
+		// in `providerState` to go on with the conversation.
+		message Message
+		usage   Usage
+		stop    StopReason
+		// Why it failed, when it errored.
+		error   string
+	}
+
+	partial type Client {
+		// Batches of requests: create, get, list, cancel, delete, results.
+		batches Batches {
+			def get() Batches {
+				return new Batches(self)
+			}
+		}
+	}
+
+	// The batch endpoints of a client (`ai.batches`).
+	type Batches {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Sends `requests` to be answered within a day. A batch runs one
+		// model: every request names the same.
+		// Fails with RemoteError BadRequest for no requests or several
+		// models, and when the API refuses the batch.
+		def create(requests BatchRequest[], name string = "") !Batch {
+			fail RemoteError{message: "gemini: a batch needs requests", code: "badrequest", kind: RemoteErrorKind.BadRequest} when requests.len() == 0
+			let model = requests[0].request.model
+			let list any[] = []
+			for let (_, r) in requests {
+				fail RemoteError{message: "gemini: a batch runs one model; {r.id} names {r.request.model}, not {model}", code: "badrequest", kind: RemoteErrorKind.BadRequest} unless r.request.model == model
+				list.push(map<string, any>{"request": try contentBody(client, r.request), "metadata": map<string, any>{"key": r.id}})
+			}
+			let batch = map<string, any>{"displayName": name.len() > 0 ?? (name, "adm batch"), "inputConfig": map<string, any>{"requests": map<string, any>{"requests": list}}}
+			return batchOf(try objectOf(try post(client, "/{modelPath(model)}:batchGenerateContent", map<string, any>{"batch": batch})))
+		}
+
+		// The batch `id` ("batches/abc" or "abc"), as it is now.
+		// Fails with RemoteError NotFound when there is none.
+		def get(id string) !Batch {
+			return batchOf(try objectOf(try fetch(client, "/" + resourcePath(id, "batches/"))))
+		}
+
+		// Every batch of the project.
+		// Fails with RemoteError when the API cannot be asked.
+		def list() !Batch[] {
+			let out Batch[]
+			for let (_, item) in try listAll(client, "/batches", "operations") {
+				out.push(batchOf(item))
+			}
+			return out
+		}
+
+		// Stops the batch `id`; what it answered stays.
+		// Fails with RemoteError NotFound when there is none.
+		def cancel(id string) !none {
+			try objectOf(try post(client, "/" + resourcePath(id, "batches/") + ":cancel", new map<string, any>()))
+			return none
+		}
+
+		// Deletes the batch `id`.
+		// Fails with RemoteError NotFound when there is none.
+		def delete(id string) !none {
+			try objectOf(try sent(client, try request(client, http.Method.DELETE, client.baseURL + "/" + resourcePath(id, "batches/"))))
+			return none
+		}
+
+		// The answers of the batch `id`, in the order of its requests.
+		// Fails like `get`, and with RemoteError BadRequest while the batch
+		// has not succeeded.
+		def results(id string) !BatchResult[] {
+			let job = try objectOf(try fetch(client, "/" + resourcePath(id, "batches/")))
+			let details = objectAt(job, "metadata")
+			let state = textAt(details, "state")
+			fail RemoteError{message: "gemini: the batch {id} is {state}; its results come once it succeeded", code: "badrequest", kind: RemoteErrorKind.BadRequest} unless state := "BATCH_STATE_SUCCEEDED" || "JOB_STATE_SUCCEEDED"
+			let out BatchResult[]
+			for let (_, item) in listAt(objectAt(objectAt(details, "output"), "inlinedResponses"), "inlinedResponses") {
+				continue unless item is map<string, any>
+				let key = textAt(objectAt(item, "metadata"), "key")
+				let error = objectAt(item, "error")
+				if error.len() > 0 {
+					out.push(BatchResult{id: key, outcome: BatchOutcome.Errored, message: Message{}, usage: Usage{}, stop: StopReason.End, error: textAt(error, "message")})
+					continue
+				}
+				let (message, used, stop) = try replyOf(objectAt(item, "response"))
+				out.push(BatchResult{id: key, outcome: BatchOutcome.Succeeded, message: message, usage: used, stop: stop, error: ""})
+			}
+			return out
+		}
+	}
+
+	internal def batchOf(job map<string, any>) Batch {
+		let details = objectAt(job, "metadata")
+		return Batch{id: textAt(job, "name"), status: textAt(details, "state"), model: textAt(details, "model"), created: timeAt(details, "createTime"), ended: timeAt(details, "endTime")}
+	}
+}

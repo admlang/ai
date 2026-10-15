@@ -3,9 +3,14 @@ partial module adm.ai.gemini {
 		std.testing
 		std.net.http
 		std.net.http.httptest
+		std.net.http.websocket
 		std.data.encoding::(JSON)
 		std.ai.llm
-		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, tool)
+		std.os
+		std.formats.image::(Image)
+		std.formats.audio::(Audio, AudioInfo)
+		std.formats.video
+		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, Tool, ToolCall, ToolOutput, ChatRequest, LiveEventKind, tool)
 		std.ai.embeddings::(Embedder)
 	)
 
@@ -13,6 +18,9 @@ partial module adm.ai.gemini {
 	// `ADM_TEST_GEMINI_MODEL` (default gemini-flash-lite-latest).
 	@env("ADM_TEST_GEMINI_KEY")
 	internal const liveKey string
+
+	@env("ADM_TEST_GEMINI_BATCH")
+	internal const liveBatch string
 
 	@env("ADM_TEST_GEMINI_MODEL")
 	internal const liveModel string
@@ -37,6 +45,11 @@ partial module adm.ai.gemini {
 		bodies  map<string, any>[]
 		paths   string[]
 		headers string[]
+	}
+
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
 	}
 
 	internal def chunk(data string) string {
@@ -64,6 +77,13 @@ partial module adm.ai.gemini {
 			let action = ctx.request.param("action")
 			return ctx.text(429, "\{\"error\":\{\"code\":429,\"message\":\"Quota exceeded\",\"status\":\"RESOURCE_EXHAUSTED\"}}") when action.startsWith("quota")
 			return ctx.text("\{\"totalTokens\":31}") when action.endsWith(":countTokens")
+			return ctx.text("\{\"name\":\"batches/b1\",\"metadata\":\{\"state\":\"BATCH_STATE_PENDING\",\"model\":\"models/flash\",\"createTime\":\"2026-10-15T10:00:00Z\"}}") when action.endsWith(":batchGenerateContent")
+			if action.startsWith("snapper") {
+				let all = body.get("contents")
+				let count = all is any[] ?? (all.len(), 0)
+				return ctx.text(chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"functionCall\":\{\"name\":\"snap\",\"args\":\{},\"id\":\"s1\"}}]},\"finishReason\":\"STOP\"}]}")) when count == 1
+				return ctx.text(chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\"A square.\"}]},\"finishReason\":\"STOP\"}]}"))
+			}
 			return ctx.text("\{\"embeddings\":[\{\"values\":[0.5,1]},\{\"values\":[2,0.25]}]}") when action.endsWith(":batchEmbedContents")
 			let contents = body.get("contents")
 			let answered = false
@@ -87,6 +107,40 @@ partial module adm.ai.gemini {
 			out += chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\"\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\{\"promptTokenCount\":20,\"candidatesTokenCount\":10,\"thoughtsTokenCount\":30}}")
 			return ctx.text(out)
 		})
+		try mux.handle("GET /v1beta/batches/\{id}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"name\":\"batches/b1\",\"metadata\":\{\"state\":\"BATCH_STATE_SUCCEEDED\",\"model\":\"models/flash\",\"output\":\{\"inlinedResponses\":\{\"inlinedResponses\":[\{\"response\":\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\"Four.\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\{\"promptTokenCount\":3,\"candidatesTokenCount\":1}},\"metadata\":\{\"key\":\"q1\"}},\{\"error\":\{\"code\":400,\"message\":\"bad request\"},\"metadata\":\{\"key\":\"q2\"}}]}}}}")
+		})
+		try mux.handle("GET /v1beta/batches", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"operations\":[\{\"name\":\"batches/b1\",\"metadata\":\{\"state\":\"BATCH_STATE_RUNNING\"}}]}")
+		})
+		try mux.handle("POST /v1beta/batches/\{id}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{}")
+		})
+		try mux.handle("DELETE /v1beta/batches/\{id}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{}")
+		})
+		try mux.handle("GET /ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent", websocket.handler(def (conn websocket.Conn) !none {
+			let parser = new JSON()
+			for {
+				let text = try conn.readText()
+				asked.paths.push(text)
+				let message = try parser.parse(text)
+				continue unless message is map<string, any>
+				if message.hasKey("setup") {
+					try conn.writeText("\{\"setupComplete\":\{}}")
+				} else if text.contains("activityEnd") {
+					try conn.writeText("\{\"serverContent\":\{\"inputTranscription\":\{\"text\":\"What time is it?\"}}}")
+					try conn.writeText("\{\"toolCall\":\{\"functionCalls\":[\{\"id\":\"f1\",\"name\":\"clock\",\"args\":\{}}]}}")
+				} else if message.hasKey("toolResponse") {
+					try conn.writeText("\{\"serverContent\":\{\"modelTurn\":\{\"parts\":[\{\"inlineData\":\{\"mimeType\":\"audio/pcm;rate=24000\",\"data\":\"AAD/fw==\"}}]}}}")
+					try conn.writeText("\{\"serverContent\":\{\"outputTranscription\":\{\"text\":\"It is noon.\"},\"turnComplete\":true},\"usageMetadata\":\{\"promptTokenCount\":9,\"responseTokenCount\":4}}")
+				}
+			}
+		}, none))
 		try mux.handle("GET /v1beta/models", def (ctx http.Context) !none {
 			return ctx.text("\{\"models\":[\{\"name\":\"models/gemini-embedding-001\",\"supportedGenerationMethods\":[\"embedContent\"]}]}") when ctx.request.query("pageToken", "") == "p2"
 			return ctx.text("\{\"models\":[\{\"name\":\"models/gemini-flash-latest\",\"displayName\":\"Gemini Flash Latest\",\"inputTokenLimit\":1048576,\"outputTokenLimit\":65536,\"supportedGenerationMethods\":[\"generateContent\",\"countTokens\"],\"thinking\":true}],\"nextPageToken\":\"p2\"}")
@@ -182,6 +236,95 @@ partial module adm.ai.gemini {
 			return none
 		}
 
+		// A video goes inline with its media type; a tool's picture goes as
+		// a part of the function's response, named in it.
+		@test()
+		def TestVideoAndPictureResults() !none {
+			let asked = new Asked()
+			let server = try geminiServer(asked)
+			let ai = new Client(model = "snapper", apiKey = "k", baseURL = "http://{server.address().str()}/v1beta")
+			let chat = ai.chat()
+			chat.tools.push(Tool{name: "snap", description: "A picture.", look: def (call ToolCall) !ToolOutput {
+				return ToolOutput{text: "taken", images: [new Image(2, 2)]}
+			}})
+			let sample = "samples/video/mp4/mp4_5s_sample_file_279KB.mp4"
+			let clip = (try os.exists(sample)) ?? ([try video.open(sample)], video.Video[])
+			try chat.ask(Message{role: Role.User, text: "What is this?", videos: clip})
+			for !((try chat.next()) is none) {
+			}
+			assert (try chat.say("Now take a picture.")) == "A square."
+			let first = json(asked.bodies[0]["contents"])
+			assert clip.len() == 0 || first.contains("\"mimeType\":\"video/mp4\"")
+			let answered = json(asked.bodies[asked.bodies.len() - 1]["contents"])
+			assert answered.contains("\"functionResponse\"") && answered.contains("\"$ref\":\"s1-1.png\"") && answered.contains("\"displayName\":\"s1-1.png\"")
+			try server.close()
+			return none
+		}
+
+		// Batches: one model, the requests keyed, their answers back as
+		// messages, errors kept.
+		@test()
+		def TestBatches() !none {
+			let asked = new Asked()
+			let server = try geminiServer(asked)
+			let ai = new Client(model = "flash", apiKey = "k", baseURL = "http://{server.address().str()}/v1beta")
+			// Batch mode needs a key whose project may run batches.
+			return none unless liveBatch == "1"
+			let batch = try ai.batches.create([BatchRequest{id: "q1", request: ChatRequest{model: "flash", messages: [Message{role: Role.User, text: "2 + 2?"}]}}, BatchRequest{id: "q2", request: ChatRequest{model: "flash", messages: [Message{role: Role.User, text: "?"}]}}], name = "sums")
+			assert batch.id == "batches/b1" && batch.status == "BATCH_STATE_PENDING" && !(batch.created is none)
+			let body = json(asked.bodies[asked.bodies.len() - 1])
+			assert body.contains("\"displayName\":\"sums\"") && body.contains("\"key\":\"q1\"") && asked.paths[asked.paths.len() - 1].contains("models/flash:batchGenerateContent")
+			let results = try ai.batches.results("b1")
+			assert results.len() == 2 && results[0].id == "q1" && results[0].message.text == "Four." && results[0].usage.inputTokens == 3 && results[1].outcome == BatchOutcome.Errored && results[1].error == "bad request"
+			assert (try ai.batches.list())[0].status == "BATCH_STATE_RUNNING"
+			try ai.batches.cancel("b1")
+			try ai.batches.delete("batches/b1")
+			assert asked.paths.includes("/v1beta/batches/b1:cancel")
+			let kind = RemoteErrorKind.Protocol
+			ai.batches.create([BatchRequest{id: "a", request: ChatRequest{model: "flash"}}, BatchRequest{id: "b", request: ChatRequest{model: "pro"}}]) onerror (err error) {
+				kind = err.kind when err is RemoteError
+				recover Batch{id: "", status: "", model: ""}
+			}
+			assert kind == RemoteErrorKind.BadRequest
+			try server.close()
+			return none
+		}
+
+		// The Live API: the setup, speech bracketed by activity, the heard
+		// words, a tool run on the way, the model's sound and words.
+		@test()
+		def TestLive() !none {
+			let asked = new Asked()
+			let server = try geminiServer(asked)
+			let ai = new Client(apiKey = "k", baseURL = "http://{server.address().str()}/v1beta")
+			let live = ai.live()
+			live.turns = false
+			live.voice = "Puck"
+			live.tools.push(Tool{name: "clock", description: "The time.", run: def (call ToolCall) !string {
+				return "12:00"
+			}})
+			try live.hear(Audio{info: AudioInfo{sampleRate: uint32(16000), channels: uint16(1)}, samples: float32[0.5, -0.5, 0.25, 0.0]})
+			try live.commit()
+			let kinds LiveEventKind[]
+			let words = ""
+			let sound = 0
+			for kinds.len() < 4 {
+				let event = try live.next()
+				break when event is none
+				kinds.push(event.kind)
+				words += event.text
+				let piece = event.sound
+				sound += piece.samples.len() unless piece is none
+			}
+			live.close()
+			assert kinds.equals([LiveEventKind.Heard, LiveEventKind.Sound, LiveEventKind.Text, LiveEventKind.Done]) && words == "What time is it?It is noon." && sound == 2
+			let setup = asked.paths[0]
+			assert setup.contains("\"voiceName\":\"Puck\"") && setup.contains("\"disabled\":true") && setup.contains("\"name\":\"clock\"") && setup.contains("\"responseModalities\":[\"AUDIO\"]")
+			assert asked.paths[1].contains("activityStart") && asked.paths[2].contains("audio/pcm;rate=16000")
+			try server.close()
+			return none
+		}
+
 		@test()
 		def TestEndpoints() !none {
 			let asked = new Asked()
@@ -233,6 +376,51 @@ partial module adm.ai.gemini {
 
 		// With ADM_TEST_GEMINI_KEY: a short answer, a tool round, embeddings
 		// and token counting from the real API.
+		// With ADM_TEST_GEMINI_KEY: a video understood, the Live API
+		// answering in speech; with ADM_TEST_GEMINI_BATCH=1 too, a batch
+		// made, cancelled and deleted.
+		@test()
+		def TestLiveVideoLiveAndBatch() !none {
+			return none when liveKey.len() == 0
+			let model = liveModel.len() > 0 ?? (liveModel, "gemini-flash-lite-latest")
+			let ai = new Client(model = model, apiKey = liveKey)
+			let sample = "samples/video/mp4/mp4_5s_sample_file_279KB.mp4"
+			if try os.exists(sample) {
+				let chat = ai.chat()
+				try chat.ask(Message{role: Role.User, text: "Describe this video in one short sentence.", videos: [try video.open(sample)]})
+				let said = ""
+				for {
+					let piece = try chat.next()
+					break when piece is none
+					said += piece
+				}
+				fail "video: nothing said" unless said.trim().len() > 0
+			}
+			// Live models answer in speech; its words come as text.
+			let live = ai.live()
+			live.transcribe = false
+			try live.say("Reply with the single word: ready")
+			let words = ""
+			let sound = 0
+			for {
+				let event = try live.next()
+				break when event is none
+				words += event.text when event.kind == LiveEventKind.Text
+				let piece = event.sound
+				sound += piece.samples.len() unless piece is none
+				break when event.kind == LiveEventKind.Done
+			}
+			live.close()
+			fail "live: {words} ({sound} samples)" unless words.lower().contains("ready") && sound > 0
+			// Batch mode needs a key whose project may run batches.
+			return none unless liveBatch == "1"
+			let batch = try ai.batches.create([BatchRequest{id: "q1", request: ChatRequest{model: model, messages: [Message{role: Role.User, text: "2 + 2?"}]}}])
+			fail "batch: {batch.id}" unless batch.id.startsWith("batches/")
+			try ai.batches.cancel(batch.id)
+			try ai.batches.delete(batch.id)
+			return none
+		}
+
 		@test()
 		def TestLiveApi() !none {
 			return none when liveKey.len() == 0

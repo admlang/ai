@@ -5,11 +5,12 @@ partial module adm.ai.openai {
 		std.testing
 		std.net.http
 		std.net.http.httptest
+		std.net.http.websocket
 		std.data.encoding::(JSON, Base64)
 		std.formats.image::(Image)
 		std.formats.audio::(Audio, AudioInfo)
 		std.ai.llm
-		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, StopReason, tool)
+		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, StopReason, Tool, ToolCall, ToolOutput, LiveEventKind, tool)
 		std.ai.embeddings::(Embedder)
 	)
 
@@ -54,6 +55,11 @@ partial module adm.ai.openai {
 		forms   string[]
 	}
 
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
+	}
+
 	// One server-sent event of JSON `data`.
 	internal def sse(data string) string {
 		return "data: {data}\n\n"
@@ -88,6 +94,22 @@ partial module adm.ai.openai {
 				return ctx.text(401, "\{\"error\":\{\"message\":\"Incorrect API key provided\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}")
 			}
 			return ctx.text(sse("\{\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}") + sse("\{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"The server had an error\"}")) when "{body["model"]}" == "breaks"
+			if "{body["model"]}" == "hosted" {
+				let png = (new Base64()).encode(try pngOf(new Image(1, 1)))
+				let out = sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":\{\"type\":\"search\",\"query\":\"oslo weather\",\"sources\":[\{\"type\":\"url\",\"url\":\"https://met.example\"}]}}}")
+				out += sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"code_interpreter_call\",\"id\":\"ci_1\",\"status\":\"completed\",\"code\":\"print(6*7)\",\"container_id\":\"cntr_1\",\"outputs\":[\{\"type\":\"logs\",\"logs\":\"42\\n\"}]}}")
+				out += sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"mcp_call\",\"id\":\"mcp_1\",\"server_label\":\"wiki\",\"name\":\"lookup\",\"arguments\":\"\{}\",\"output\":\"found\",\"error\":null}}")
+				out += sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"image_generation_call\",\"id\":\"ig_1\",\"status\":\"completed\",\"result\":\"{png}\"}}")
+				out += sse("\{\"type\":\"response.output_text.delta\",\"delta\":\"Rain, see met.\"}")
+				out += sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[\{\"type\":\"output_text\",\"text\":\"Rain, see met.\",\"annotations\":[\{\"type\":\"url_citation\",\"url\":\"https://met.example\",\"title\":\"Met\",\"start_index\":10,\"end_index\":13}],\"logprobs\":[\{\"token\":\"Rain\",\"logprob\":-0.5,\"top_logprobs\":[\{\"token\":\"Rain\",\"logprob\":-0.5},\{\"token\":\"Sun\",\"logprob\":-1.5}]}]}]}}")
+				return ctx.text(out + sse("\{\"type\":\"response.completed\",\"response\":\{\"usage\":\{\"input_tokens\":9,\"output_tokens\":9}}}"))
+			}
+			if "{body["model"]}" == "pictured" {
+				let items = body["input"]
+				let count = items is any[] ?? (items.len(), 0)
+				return ctx.text(sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_snap\",\"name\":\"snap\",\"arguments\":\"\{}\"}}") + sse("\{\"type\":\"response.completed\",\"response\":\{\"usage\":\{}}}")) when count == 1
+				return ctx.text(sse("\{\"type\":\"response.output_text.delta\",\"delta\":\"A dot.\"}") + sse("\{\"type\":\"response.completed\",\"response\":\{\"usage\":\{}}}"))
+			}
 			let input = body["input"]
 			let answered = false
 			if input is any[] {
@@ -108,6 +130,29 @@ partial module adm.ai.openai {
 			out += sse("\{\"type\":\"response.completed\",\"response\":\{\"status\":\"completed\",\"usage\":\{\"input_tokens\":20,\"input_tokens_details\":\{\"cached_tokens\":0},\"output_tokens\":30,\"output_tokens_details\":\{\"reasoning_tokens\":25}}}}")
 			return ctx.text(out)
 		})
+		try mux.handle("GET /v1/realtime", websocket.handler(def (conn websocket.Conn) !none {
+			let parser = new JSON()
+			let emit = def (text string) !none {
+				return conn.writeText(text)
+			}
+			for {
+				let text = try conn.readText()
+				sent.paths.push(text)
+				let event = try parser.parse(text)
+				continue unless event is map<string, any>
+				let kind = "{event.get("type")}"
+				if kind == "input_audio_buffer.commit" {
+					try emit("\{\"type\":\"input_audio_buffer.speech_started\"}")
+					try emit("\{\"type\":\"conversation.item.input_audio_transcription.completed\",\"transcript\":\"What time is it?\"}")
+					try emit("\{\"type\":\"response.function_call_arguments.done\",\"call_id\":\"c1\",\"name\":\"clock\",\"arguments\":\"\{}\"}")
+					try emit("\{\"type\":\"response.done\",\"response\":\{\"usage\":\{\"input_tokens\":5,\"output_tokens\":2}}}")
+				} else if kind == "conversation.item.create" && text.contains("function_call_output") {
+					try emit("\{\"type\":\"response.output_audio.delta\",\"delta\":\"AAD/fw==\"}")
+					try emit("\{\"type\":\"response.output_audio_transcript.delta\",\"delta\":\"It is noon.\"}")
+					try emit("\{\"type\":\"response.done\",\"response\":\{\"usage\":\{\"input_tokens\":7,\"output_tokens\":4}}}")
+				}
+			}
+		}, none))
 		try mux.handle("POST /v1/chat/completions", def (ctx http.Context) !none {
 			let body = try keep(ctx)
 			let messages = body["messages"]
@@ -293,6 +338,105 @@ partial module adm.ai.openai {
 			return none
 		}
 
+		// Hosted tools: their declarations and include list, what they did,
+		// the reply's citation, image and token probabilities.
+		@test()
+		def TestHostedToolsAndLogprobs() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(model = "hosted", apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			ai.api = Api.Responses
+			ai.webSearch = WebSearch{contextSize: "low", location: Location{country: "NO"}}
+			ai.fileSearch = FileSearch{vectorStores: ["vs_1"], maxResults: 3}
+			ai.codeInterpreter = CodeInterpreter{}
+			ai.mcpServers = [McpServer{label: "wiki", url: "https://mcp.example", allowedTools: ["lookup"]}]
+			ai.imageGeneration = ImageGeneration{size: "1024x1024"}
+			ai.logprobs = true
+			ai.topLogprobs = 2
+			let chat = ai.chat()
+			let reply = try chat.say("Weather in Oslo?")
+			assert reply == "\n```python\nprint(6*7)\n```\n```\n42\n```\nRain, see met."
+			let answer = chat.messages()[1]
+			let runs = hostedRunsOf(answer)
+			assert runs.len() == 4 && runs[0].tool == "web_search" && runs[0].input == "oslo weather" && runs[1].output == "42\n" && runs[2].tool == "mcp" && runs[2].output == "found" && runs[3].tool == "image_generation"
+			let cites = citationsOf(answer)
+			assert cites.len() == 1 && cites[0].url == "https://met.example" && cites[0].start == 10 && cites[0].end == 13
+			assert (try imagesOf(answer)).len() == 1
+			let probs = logprobsOf(answer)
+			assert probs.len() == 1 && probs[0].token == "Rain" && probs[0].alternatives.equals(string["Rain", "Sun"]) && probs[0].likelihoods[1] == -1.5
+			let body = sent.bodies[0]
+			let tools = json(body["tools"])
+			assert tools.contains("\"type\":\"web_search\"") && tools.contains("\"vector_store_ids\":[\"vs_1\"]") && tools.contains("\"container\":\{\"type\":\"auto\"}") && tools.contains("\"require_approval\":\"never\"") && tools.contains("\"type\":\"image_generation\"")
+			let include = json(body["include"])
+			assert include.contains("message.output_text.logprobs") && include.contains("code_interpreter_call.outputs") && "{body["top_logprobs"]}" == "2"
+			// The hosted items go back with the next request, the message rebuilt.
+			try chat.say("Thanks.")
+			let again = json(sent.bodies[1]["input"])
+			assert again.contains("\"type\":\"web_search_call\"") && again.contains("\"type\":\"mcp_call\"") && !again.contains("\"id\":\"msg_1\"")
+			// Chat Completions runs no hosted tools.
+			ai.api = Api.ChatCompletions
+			assert failure(def () !none {
+				try ai.chat().say("Hi")
+			}).kind == RemoteErrorKind.BadRequest
+			try server.close()
+			return none
+		}
+
+		// A tool whose result is a picture: sent as an input image of the
+		// call's output.
+		@test()
+		def TestPictureResults() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(model = "pictured", apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			ai.api = Api.Responses
+			let chat = ai.chat()
+			chat.tools.push(Tool{name: "snap", description: "A picture.", look: def (call ToolCall) !ToolOutput {
+				return ToolOutput{text: "a picture", images: [new Image(2, 2)]}
+			}})
+			assert (try chat.say("Take a picture.")) == "A dot."
+			let output = json(sent.bodies[1]["input"])
+			assert output.contains("\"type\":\"function_call_output\"") && output.contains("\"type\":\"input_image\"") && output.contains("data:image/png;base64,")
+			try server.close()
+			return none
+		}
+
+		// The Realtime API: the session set up, sound sent at 24 kHz, the
+		// heard words, a tool run on the way, the model's sound and words.
+		@test()
+		def TestRealtime() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			let live = ai.live()
+			live.system = "Be brief."
+			live.turns = false
+			live.tools.push(Tool{name: "clock", description: "The time.", run: def (call ToolCall) !string {
+				return "12:00"
+			}})
+			try live.hear(Audio{info: AudioInfo{sampleRate: uint32(48000), channels: uint16(2)}, samples: float32[0.5, 0.5, -0.5, -0.5, 0.25, 0.25, 0.0, 0.0]})
+			try live.commit()
+			let kinds LiveEventKind[]
+			let words = ""
+			let sound = 0
+			for kinds.len() < 6 {
+				let event = try live.next()
+				break when event is none
+				kinds.push(event.kind)
+				words += event.text when event.kind := LiveEventKind.Text || LiveEventKind.Heard
+				let piece = event.sound
+				sound += piece.samples.len() unless piece is none
+			}
+			live.close()
+			assert kinds.equals([LiveEventKind.Interrupted, LiveEventKind.Heard, LiveEventKind.Done, LiveEventKind.Sound, LiveEventKind.Text, LiveEventKind.Done])
+			assert words == "What time is it?It is noon." && sound == 2
+			let setup = sent.paths[0]
+			assert setup.contains("\"type\":\"session.update\"") && setup.contains("\"instructions\":\"Be brief.\"") && setup.contains("\"rate\":24000") && setup.contains("\"turn_detection\":null") && setup.contains("\"name\":\"clock\"")
+			assert sent.paths[1].contains("input_audio_buffer.append") && sent.paths[2].contains("input_audio_buffer.commit") && sent.paths[4].contains("\"output\":\"12:00\"")
+			try server.close()
+			return none
+		}
+
 		@test()
 		def TestChatCompletionsApi() !none {
 			let sent = new Sent()
@@ -420,6 +564,40 @@ partial module adm.ai.openai {
 		// With ADM_TEST_OPENAI_KEY or ADM_TEST_OPENAI_URL: both
 		// conversation APIs, a tool call, embeddings and the model list from
 		// the real thing.
+		@test()
+		def TestLiveHostedAndRealtime() !none {
+			return none when liveKey.len() == 0 || liveURL.len() > 0
+			let ai = new Client(model = "gpt-5-mini", apiKey = liveKey)
+			ai.api = Api.Responses
+			ai.webSearch = WebSearch{contextSize: "low"}
+			let chat = ai.chat()
+			let reply = try chat.say("Search the web: what is the capital of Norway? Answer in one short sentence and cite the source.")
+			let answer = chat.messages()[1]
+			fail "search: {reply}" unless reply.contains("Oslo") && hostedRunsOf(answer).len() > 0 && citationsOf(answer).len() > 0
+			let plain = new Client(model = "gpt-4.1-mini", apiKey = liveKey)
+			plain.api = Api.Responses
+			plain.logprobs = true
+			plain.topLogprobs = 2
+			let small = plain.chat()
+			try small.say("Say yes.")
+			let probs = logprobsOf(small.messages()[1])
+			fail "no log probabilities" unless probs.len() > 0 && probs[0].alternatives.len() == 2
+			let live = ai.live()
+			live.speech = false
+			live.transcribe = false
+			try live.say("Reply with the single word: ready")
+			let text = ""
+			for {
+				let event = try live.next()
+				break when event is none
+				text += event.text when event.kind == LiveEventKind.Text
+				break when event.kind == LiveEventKind.Done
+			}
+			live.close()
+			fail "realtime: {text}" unless text.lower().contains("ready")
+			return none
+		}
+
 		@test()
 		def TestLiveServer() !none {
 			return none when liveURL.len() == 0 && liveKey.len() == 0

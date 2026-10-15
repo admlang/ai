@@ -1,0 +1,297 @@
+partial module adm.ai.anthropic {
+	use (
+		std.data.encoding::(JSON)
+		std.ai.llm::(Message, RemoteFile)
+	)
+
+	// Where a search is localized.
+	struct Location {
+		city     string = ""
+		region   string = ""
+		// Two letters, ISO 3166-1 alpha-2.
+		country  string = ""
+		// An IANA time zone ("Europe/Oslo").
+		timezone string = ""
+	}
+
+	// The web search Anthropic runs for the model (`Client.webSearch`):
+	// the results come back in the reply with their citations.
+	struct WebSearch {
+		// Searches a reply may run; 0 for no limit.
+		maxUses        int       = 0
+		// Only these domains, or never these (not both).
+		allowedDomains string[]  = []
+		blockedDomains string[]  = []
+		location       ?Location = none
+		// Lets the model filter the results with code before they reach
+		// its context (Claude 4.6 and later).
+		filtering      bool      = false
+	}
+
+	// The page and PDF fetching Anthropic runs for the model
+	// (`Client.webFetch`). It fetches only addresses the conversation
+	// named or earlier results held.
+	struct WebFetch {
+		// Fetches a reply may run; 0 for no limit.
+		maxUses          int      = 0
+		allowedDomains   string[] = []
+		blockedDomains   string[] = []
+		// Lets the model cite passages of what it fetched.
+		citations        bool     = true
+		// Tokens of a page the model reads at most; 0 for the API's limit.
+		maxContentTokens int      = 0
+		// Lets the model filter the pages with code before they reach its
+		// context (Claude 4.6 and later).
+		filtering        bool     = false
+		// Fetches afresh instead of from Anthropic's cache.
+		fresh            bool     = false
+	}
+
+	// Clears older tool results once the prompt passes a size
+	// (`Client.clearToolUses`, context editing).
+	struct ClearToolUses {
+		// Prompt tokens past which results are cleared.
+		atTokens     int      = 100000
+		// The newest calls whose results stay.
+		keep         int      = 3
+		// Tokens a clearing frees at least, or none clears (0: any).
+		atLeast      int      = 0
+		// Tools whose results are never cleared.
+		exclude      string[] = []
+		// Clears the calls' arguments too.
+		clearInputs  bool     = false
+	}
+
+	// Clears the thinking of older turns (`Client.clearThinking`): the
+	// newest `keep` turns keep theirs; 0 keeps every turn's.
+	struct ClearThinking {
+		keep int = 1
+	}
+
+	// What a citation points at.
+	enum CitationKind {
+		// A web page a search found or a fetch read.
+		WebPage,
+		// Characters of a plain-text document.
+		Characters,
+		// Pages of a PDF.
+		Pages,
+		// Content blocks of a custom document.
+		Blocks,
+		// A search result a tool returned.
+		SearchResult,
+	}
+
+	// A passage the reply rests on.
+	struct Citation {
+		kind          CitationKind
+		// The words cited, as the source has them.
+		text          string
+		// The reply's text the citation backs.
+		claim         string
+		// A web page's address and title.
+		url           string = ""
+		title         string = ""
+		// A document by its position among the conversation's documents,
+		// and its title.
+		document      int    = -1
+		documentTitle string = ""
+		// Where in the document: characters, pages (from 1) or blocks,
+		// the end not included.
+		start         int    = 0
+		end           int    = 0
+	}
+
+	// One run of a tool Anthropic ran during the reply.
+	struct ServerToolRun {
+		// web_search, web_fetch, bash_code_execution,
+		// text_editor_code_execution, or another server tool's name.
+		tool   string
+		// What the model asked for, as JSON.
+		input  string
+		// What the tool gave back, as JSON; "" when it failed.
+		output string
+		// The tool's error code ("max_uses_exceeded", "url_not_accessible",
+		// ...); "" when it ran.
+		error  string
+	}
+
+	// The settings a client sends besides the conversation: the server
+	// tools' declarations.
+	internal def serverTools(client Client) any[] {
+		let out any[] = []
+		let search = client.webSearch
+		if !(search is none) {
+			let tool = map<string, any>{"type": search.filtering ?? ("web_search_20260318", "web_search_20250305"), "name": "web_search"}
+			tool.set("max_uses", search.maxUses) when search.maxUses > 0
+			tool.set("allowed_domains", texts(search.allowedDomains)) when search.allowedDomains.len() > 0
+			tool.set("blocked_domains", texts(search.blockedDomains)) when search.blockedDomains.len() > 0
+			let place = search.location
+			if !(place is none) {
+				let area = map<string, any>{"type": "approximate"}
+				area.set("city", place.city) when place.city.len() > 0
+				area.set("region", place.region) when place.region.len() > 0
+				area.set("country", place.country) when place.country.len() > 0
+				area.set("timezone", place.timezone) when place.timezone.len() > 0
+				tool.set("user_location", area)
+			}
+			tool.set("allowed_callers", any["direct"]) unless search.filtering
+			out.push(tool)
+		}
+		let fetch = client.webFetch
+		if !(fetch is none) {
+			let newer = fetch.filtering || fetch.fresh
+			let tool = map<string, any>{"type": newer ?? ("web_fetch_20260318", "web_fetch_20250910"), "name": "web_fetch"}
+			tool.set("max_uses", fetch.maxUses) when fetch.maxUses > 0
+			tool.set("allowed_domains", texts(fetch.allowedDomains)) when fetch.allowedDomains.len() > 0
+			tool.set("blocked_domains", texts(fetch.blockedDomains)) when fetch.blockedDomains.len() > 0
+			tool.set("citations", map<string, any>{"enabled": fetch.citations})
+			tool.set("max_content_tokens", fetch.maxContentTokens) when fetch.maxContentTokens > 0
+			tool.set("use_cache", false) when fetch.fresh
+			tool.set("allowed_callers", any["direct"]) when newer && !fetch.filtering
+			out.push(tool)
+		}
+		if client.codeExecution {
+			let filtering = (search is none ?? (false, search.filtering)) || (fetch is none ?? (false, fetch.filtering))
+			out.push(map<string, any>{"type": filtering ?? ("code_execution_20260120", "code_execution_20250825"), "name": "code_execution"})
+		}
+		return out
+	}
+
+	// The context editing a client asks for, with its beta header; none
+	// when it asks for none.
+	internal def contextManagement(client Client) ?map<string, any> {
+		let edits any[] = []
+		let thinking = client.clearThinking
+		if !(thinking is none) {
+			// Thinking clearing comes first.
+			let keep any = thinking.keep > 0 ?? (map<string, any>{"type": "thinking_turns", "value": thinking.keep}, "all")
+			edits.push(map<string, any>{"type": "clear_thinking_20251015", "keep": keep})
+		}
+		let tools = client.clearToolUses
+		if !(tools is none) {
+			let edit = map<string, any>{"type": "clear_tool_uses_20250919", "trigger": map<string, any>{"type": "input_tokens", "value": tools.atTokens}, "keep": map<string, any>{"type": "tool_uses", "value": tools.keep}}
+			edit.set("clear_at_least", map<string, any>{"type": "input_tokens", "value": tools.atLeast}) when tools.atLeast > 0
+			edit.set("exclude_tools", texts(tools.exclude)) when tools.exclude.len() > 0
+			edit.set("clear_tool_inputs", true) when tools.clearInputs
+			edits.push(edit)
+		}
+		if client.compactAt > 0 {
+			let edit = map<string, any>{"type": "compact_20260112", "trigger": map<string, any>{"type": "input_tokens", "value": client.compactAt}}
+			edit.set("instructions", client.compactInstructions) when client.compactInstructions.len() > 0
+			edits.push(edit)
+		}
+		return edits.len() == 0 ?? (none, map<string, any>{"edits": edits})
+	}
+
+	// The citations of a reply of this library; empty for another message.
+	def citationsOf(reply Message) Citation[] {
+		let out Citation[]
+		for let (_, b) in blocksOf(reply) {
+			continue unless b is map<string, any> && textAt(b, "type") == "text"
+			for let (_, c) in listAt(b, "citations") {
+				continue unless c is map<string, any>
+				let citation = Citation{kind: CitationKind.WebPage, text: textAt(c, "cited_text"), claim: textAt(b, "text")}
+				match textAt(c, "type") {
+					case "web_search_result_location":
+						citation.url = textAt(c, "url")
+						citation.title = textAt(c, "title")
+					case "char_location":
+						citation.kind = CitationKind.Characters
+						citation.start = intAt(c, "start_char_index")
+						citation.end = intAt(c, "end_char_index")
+					case "page_location":
+						citation.kind = CitationKind.Pages
+						citation.start = intAt(c, "start_page_number")
+						citation.end = intAt(c, "end_page_number")
+					case "content_block_location":
+						citation.kind = CitationKind.Blocks
+						citation.start = intAt(c, "start_block_index")
+						citation.end = intAt(c, "end_block_index")
+					case "search_result_location":
+						citation.kind = CitationKind.SearchResult
+						citation.url = textAt(c, "source")
+						citation.title = textAt(c, "title")
+						citation.start = intAt(c, "start_block_index")
+						citation.end = intAt(c, "end_block_index")
+					default:
+						continue
+				}
+				if citation.kind != CitationKind.WebPage && citation.kind != CitationKind.SearchResult {
+					citation.document = intAt(c, "document_index")
+					citation.documentTitle = textAt(c, "document_title")
+				}
+				out.push(citation)
+			}
+		}
+		return out
+	}
+
+	// The server tools that ran during a reply of this library, in order.
+	def serverToolsOf(reply Message) ServerToolRun[] {
+		let out ServerToolRun[]
+		let codec = new JSON()
+		let blocks = blocksOf(reply)
+		for let (_, b) in blocks {
+			continue unless b is map<string, any> && textAt(b, "type") == "server_tool_use"
+			let id = textAt(b, "id")
+			let input = b.get("input")
+			let run = ServerToolRun{tool: textAt(b, "name"), input: input is none ?? ("\{}", string(codec.encode(input))), output: "", error: ""}
+			for let (_, r) in blocks {
+				continue unless r is map<string, any> && textAt(r, "tool_use_id") == id && textAt(r, "type").endsWith("_tool_result")
+				let content = r.get("content")
+				let error = content is map<string, any> ?? (textAt(content, "error_code"), "")
+				run.error = error
+				run.output = error.len() > 0 || content is none ?? ("", string(codec.encode(content)))
+			}
+			out.push(run)
+		}
+		return out
+	}
+
+	// The files code execution wrote (`$OUTPUT_DIR`) during a reply of this
+	// library, to read with `files.content`.
+	def outputFilesOf(reply Message) RemoteFile[] {
+		let out RemoteFile[]
+		for let (_, b) in blocksOf(reply) {
+			continue unless b is map<string, any> && textAt(b, "type") == "bash_code_execution_tool_result"
+			for let (_, f) in listAt(objectAt(b, "content"), "content") {
+				continue unless f is map<string, any>
+				let id = textAt(f, "file_id")
+				out.push(RemoteFile{id: id, mediaType: ""}) when id.len() > 0
+			}
+		}
+		return out
+	}
+
+	// The container code execution ran in during a reply of this library;
+	// "" when it ran none. The next request goes on in it.
+	def containerOf(reply Message) string {
+		return textAt(stateObjectOf(reply), "container")
+	}
+
+	// What context editing cleared before a reply of this library: each
+	// edit's type with what it cleared, as JSON objects.
+	def editsOf(reply Message) string[] {
+		let out string[]
+		let codec = new JSON()
+		for let (_, e) in listAt(stateObjectOf(reply), "edits") {
+			out.push(string(codec.encode(e))) unless e is none
+		}
+		return out
+	}
+
+	// The state a reply of this library kept: its blocks, the container,
+	// the edits. Older replies kept the blocks alone, as a list.
+	internal def stateObjectOf(m Message) map<string, any> {
+		return new map<string, any>() unless m.providerState.startsWith(blocksState)
+		let parsed = (new JSON()).parse(m.providerState.slice(blocksState.len())) onerror recover none
+		return parsed when parsed is map<string, any>
+		return parsed is any[] ?? (map<string, any>{"blocks": parsed}, new map<string, any>())
+	}
+
+	// The content blocks a reply of this library kept.
+	internal def blocksOf(m Message) any[] {
+		return listAt(stateObjectOf(m), "blocks")
+	}
+}

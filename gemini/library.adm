@@ -1,5 +1,5 @@
 // Google Gemini API client
-@manifest(version = "0.1.0")
+@manifest(version = "0.1.1")
 library adm.ai.gemini {
 	use (
 		adm.ai.gemini

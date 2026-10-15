@@ -103,8 +103,34 @@ partial module adm.ai.anthropic {
 		userId            string          = ""
 		// "auto" or "standard_only"; "" for the account's default.
 		serviceTier       string          = ""
-		// Beta features to switch on (`anthropic-beta`).
+		// Beta features to switch on (`anthropic-beta`); those the settings
+		// below need are added by themselves.
 		betas             string[]
+		// Server tools Anthropic runs during a reply: web search, page
+		// fetching, and code execution in a container (`containerOf`,
+		// `outputFilesOf`); what they did is `serverToolsOf(reply)`, what
+		// the reply cites `citationsOf(reply)`. Code and its output stream
+		// as text.
+		webSearch         ?WebSearch      = none
+		webFetch          ?WebFetch       = none
+		codeExecution     bool            = false
+		// A folder the memory tool (`memoryTool`) keeps the model's notes
+		// in, offered in every conversation `chat()` opens; "" for none.
+		memory            string          = ""
+		// What carries out computer use (Anthropic's computer toolset):
+		// screenshots and the model's clicks, typing and scrolling, offered in
+		// every conversation `chat()` opens; none for no computer use.
+		computer          ?Computer       = none
+		// Context editing: older tool results and thinking cleared as the
+		// conversation grows (`editsOf(reply)` says what went).
+		clearToolUses     ?ClearToolUses  = none
+		clearThinking     ?ClearThinking  = none
+		// Prompt tokens past which the API sums the conversation up into a
+		// compaction block that takes the place of what came before it (at
+		// least 50000; 0 for never), and the instructions it sums up with
+		// ("" for the API's own).
+		compactAt         int             = 0
+		compactInstructions string        = ""
 		// The HTTP client requests go through: headers, timeouts, a
 		// transport. Rate-limited and overloaded replies are sent again
 		// (`retry`).
@@ -126,7 +152,11 @@ partial module adm.ai.anthropic {
 		// A conversation with `model` (none: the client's). It is a
 		// `llm.Chat`.
 		def chat(model string = "") RemoteChat {
-			return new RemoteChat(self, model.len() > 0 ?? (model, self.model))
+			let chat = new RemoteChat(self, model.len() > 0 ?? (model, self.model))
+			chat.tools.push(memoryTool(memory)) when memory.len() > 0
+			let screen = computer
+			chat.tools.push(...computerTools(screen)) unless screen is none
+			return chat
 		}
 
 		// Sends `request` to /messages and returns the reply as it streams:
@@ -136,15 +166,72 @@ partial module adm.ai.anthropic {
 		def reply(request ChatRequest) !ReplyStream {
 			let body = try messagesBody(self, request)
 			body.set("stream", true)
-			let res = try post(self, "/messages", body, betasFor(self, request.model))
-			return new MessageStream(res)
+			let betas = betasOf(self, body)
+			let res = try post(self, "/messages", body, betas)
+			return new MessageStream(self, body, betas, res)
+		}
+
+		// Sums `chat` up into a compaction block that takes the place of
+		// its messages: the model writes the summary (by `instructions`, ""
+		// for the API's own) and later requests send the block first. Ask
+		// it after a reply, with no call waiting.
+		// Fails with RemoteError when the API refuses, or ends without a
+		// summary (cut off, a call instead, a refusal).
+		def compact(chat RemoteChat, instructions string = "") !none {
+			let messages Message[]
+			for let (k, m) in chat.messages() {
+				continue when k == 0 && m.role == Role.System && chat.system.len() > 0
+				messages.push(m)
+			}
+			let request = ChatRequest{model: chat.model, system: chat.system, messages: messages, tools: chat.tools, limit: chat.limit.max(4096), thinking: chat.thinking, reasoning: chat.reasoning}
+			let body = try messagesBody(self, request)
+			// What a summarizing call cannot take.
+			for let (_, key) in string["context_management", "stop_sequences", "fallbacks"] {
+				body.delete(key)
+			}
+			let output = body.get("output_config")
+			if output is map<string, any> {
+				output.delete("format")
+				body.delete("output_config") when output.len() == 0
+			}
+			let summarize = map<string, any>{"type": "summarize"}
+			summarize.set("instructions", instructions) when instructions.len() > 0
+			body.set("compaction", summarize)
+			let reply = try objectOf(try post(self, "/messages", body, betasOf(self, body)))
+			let reason = textAt(reply, "stop_reason")
+			fail RemoteError{message: "anthropic: no summary came back (stop reason {reason})", code: reason, kind: RemoteErrorKind.BadRequest} unless reason == "compaction"
+			let blocks = listAt(reply, "content")
+			let first = blocks.len() > 0 ?? (blocks[0], none)
+			let summary = first is map<string, any> ?? (textAt(first, "content"), "")
+			chat.reset()
+			let state = map<string, any>{"blocks": blocks}
+			return chat.add(Message{role: Role.Assistant, text: summary, providerState: blocksState + string((new JSON()).encode(state))})
 		}
 	}
 
-	// The beta headers a request to `model` needs.
-	internal def betasFor(client Client, model string) string[] {
+	// The beta headers `body` needs: the client's, and those of the
+	// features it uses (the refusal fallback, context editing, compaction
+	// blocks).
+	internal def betasOf(client Client, body map<string, any>) string[] {
 		let out = client.betas.clone()
-		out.push("server-side-fallback-2026-07-01") when usesFallback(client, model)
+		let add = def (name string) {
+			out.push(name) unless out.includes(name)
+		}
+		add("server-side-fallback-2026-07-01") when body.hasKey("fallbacks")
+		let managed = body.get("context_management")
+		if managed is map<string, any> {
+			add("context-management-2025-06-27")
+			for let (_, e) in listAt(managed, "edits") {
+				add("compact-2026-01-12") when e is map<string, any> && textAt(e, "type") == "compact_20260112"
+			}
+		}
+		add("compact-2026-09-04") when body.hasKey("compaction")
+		for let (_, m) in listAt(body, "messages") {
+			continue unless m is map<string, any>
+			for let (_, b) in listAt(m, "content") {
+				add("compact-2026-09-04") when b is map<string, any> && textAt(b, "type") == "compaction" && textAt(b, "signature").len() > 0
+			}
+		}
 		return out
 	}
 
@@ -156,8 +243,13 @@ partial module adm.ai.anthropic {
 	// without `stream`.
 	internal def messagesBody(client Client, request ChatRequest) !map<string, any> {
 		let messages any[] = []
+		// The names of the calls, which a result of a computer action echoes.
+		let names = new map<string, string>()
 		for let (k, m) in request.messages {
-			try addMessage(messages, m, k)
+			for let (_, c) in m.calls {
+				names.set(c.id, c.name)
+			}
+			try addMessage(messages, m, k, client.computer is none ?? (false, computerActions.includes(lookup(names, m.callId))))
 		}
 		let body = map<string, any>{"model": request.model, "max_tokens": request.limit > 0 ?? (request.limit, 4096), "messages": messages}
 		body.set("system", request.system) when request.system.len() > 0
@@ -165,15 +257,34 @@ partial module adm.ai.anthropic {
 		body.set("top_p", request.topP) unless request.topP is none
 		body.set("top_k", request.topK) unless request.topK is none
 		body.set("stop_sequences", texts(request.stopAt)) when request.stopAt.len() > 0
-		if request.tools.len() > 0 {
-			let tools any[] = []
-			for let (_, t) in request.tools {
-				let tool = map<string, any>{"name": t.name, "description": t.description, "input_schema": schemaOf(t)}
-				tool.set("eager_input_streaming", true) when client.eagerToolInput
-				tools.push(tool)
+		let tools = serverTools(client)
+		let computing = !(client.computer is none)
+		tools.push(map<string, any>{"type": computerType}) when computing
+		for let (_, t) in request.tools {
+			continue when computing && computerActions.includes(t.name)
+			if client.memory.len() > 0 && t.name == memoryName {
+				// Anthropic's own tool: its type, no schema.
+				tools.push(map<string, any>{"type": memoryType, "name": memoryName})
+				continue
 			}
+			let tool = map<string, any>{"name": t.name, "description": t.description, "input_schema": schemaOf(t)}
+			tool.set("eager_input_streaming", true) when client.eagerToolInput
+			tools.push(tool)
+		}
+		if tools.len() > 0 {
 			body.set("tools", tools)
-			body.set("tool_choice", map<string, any>{"type": "auto", "disable_parallel_tool_use": true}) unless client.parallelToolCalls
+			body.set("tool_choice", map<string, any>{"type": "auto", "disable_parallel_tool_use": true}) unless client.parallelToolCalls || request.tools.len() == 0
+		}
+		let managed = contextManagement(client)
+		body.set("context_management", managed) unless managed is none
+		// Code execution goes on in the container of the last reply that
+		// ran one.
+		for let k = request.messages.len() - 1; k >= 0; k-- {
+			let container = containerOf(request.messages[k])
+			if container.len() > 0 {
+				body.set("container", container)
+				break
+			}
 		}
 		let thinking = request.thinking
 		if thinking is bool {
@@ -226,13 +337,24 @@ partial module adm.ai.anthropic {
 	// tool's result joins the user message before it when that one holds
 	// results too: a reply's calls are answered in one message. A system
 	// message mid-conversation stays one.
-	internal def addMessage(messages any[], m Message, k int) !none {
+	internal def addMessage(messages any[], m Message, k int, computerResult bool = false) !none {
 		fail RemoteError{message: "anthropic: the Messages API takes no sound; message {k} carries {m.audio.len()} recordings", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.audio.len() > 0
+		fail RemoteError{message: "anthropic: the Messages API takes no video; message {k} carries {m.videos.len()}", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.videos.len() > 0
 		match m.role {
 			case Role.System:
 				messages.push(map<string, any>{"role": "system", "content": m.text})
 			case Role.Tool:
 				let result = map<string, any>{"type": "tool_result", "tool_use_id": m.callId, "content": m.text}
+				if m.images.len() > 0 {
+					let parts any[] = []
+					parts.push(map<string, any>{"type": "text", "text": m.text}) when m.text.len() > 0
+					let encoder = new Base64()
+					for let (_, picture) in m.images {
+						parts.push(map<string, any>{"type": "image", "source": map<string, any>{"type": "base64", "media_type": "image/png", "data": encoder.encode(try pngOf(picture))}})
+					}
+					result.set("content", parts)
+				}
+				result.set("toolset_name", computerName) when computerResult
 				let joined = resultsMessage(messages)
 				if joined is map<string, any> {
 					let content = joined.get("content")
@@ -267,6 +389,11 @@ partial module adm.ai.anthropic {
 		return none
 	}
 
+	internal def lookup(names map<string, string>, id string) string {
+		let name = names.get(id)
+		return name is none ?? ("", name)
+	}
+
 	// The last message when it is a user message of tool results, which
 	// the next result joins; none otherwise.
 	internal def resultsMessage(messages any[]) ?map<string, any> {
@@ -287,10 +414,9 @@ partial module adm.ai.anthropic {
 	// sent them (thinking with its signature, text, calls) when the
 	// message keeps them, else built from its text and calls.
 	internal def assistantContent(m Message) !any[] {
-		if m.providerState.startsWith(blocksState) {
-			let parsed = (new JSON()).parse(m.providerState.slice(blocksState.len())) onerror recover none
-			return parsed when parsed is any[]
-		}
+		let kept = stateObjectOf(m)
+		let blocks = kept.get("blocks")
+		return blocks when blocks is any[]
 		let content any[] = []
 		content.push(map<string, any>{"type": "text", "text": m.text}) when m.text.len() > 0
 		for let (_, c) in m.calls {

@@ -33,6 +33,11 @@ parts go back to the API as they came (thought signatures with them). The client
 `thinkingBudget`, `includeThoughts`, `googleSearch`, `urlContext`, `codeExecution` and `safety`
 are settings of the client.
 
+Videos go in a message (`Message.videos`, sent inline), a tool's pictures with its result
+(Gemini 3). `batches` runs requests at half the price within a day (create, get, list, cancel,
+delete, `results` as messages), and `live()` opens a spoken conversation over the Live API
+(`llm.LiveChat`: sound at 16 kHz in, 24 kHz out, transcripts, tools).
+
 ## Tests
 
 `adm test ai/gemini` runs against a loopback server. `ADM_TEST_GEMINI_KEY` adds calls to the

@@ -40,6 +40,24 @@ request; on other servers it speaks Chat Completions (`api` chooses). A conversa
 `batches` and `models`; `effort`, `verbosity`, `serviceTier`, `summarize`,
 `parallelToolCalls`, `organization` and `project` are settings of the client.
 
+Tools OpenAI runs are settings of the client (Responses API): `webSearch`, `fileSearch`
+over vector stores, `codeInterpreter`, `mcpServers` and `imageGeneration`. `hostedRunsOf(reply)`
+lists what they did, `citationsOf(reply)` what the reply cites, `imagesOf(reply)` the images;
+sandbox code and its output stream as text. `logprobs` (with `topLogprobs`) asks for each
+token's log probability: `logprobsOf(reply)`. `live()` opens a spoken conversation over the
+Realtime API (`llm.LiveChat`):
+
+```adm
+let live = ai.live()                      // gpt-realtime
+live.useTool(new Weather())
+try live.hear(recording)                  // any rate; sent at 24 kHz
+for {
+	let event = try live.next()
+	break when event is none
+	speaker.play(event.sound) when event.kind == llm.LiveEventKind.Sound
+}
+```
+
 ## Tests
 
 `adm test ai/openai` runs against a loopback server. `ADM_TEST_OPENAI_KEY` adds calls to OpenAI

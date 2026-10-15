@@ -31,6 +31,17 @@ print(chat.usage().cachedTokens)
 print(try ai.countTokens(chat))
 let file = try ai.files.upload("report.pdf", "application/pdf")
 let batch = try ai.batches.create([anthropic.BatchRequest{id: "q1", request: request}])
+
+ai.webSearch = anthropic.WebSearch{maxUses: 3}                // tools Anthropic runs
+ai.codeExecution = true
+ai.memory = "notes"                                         // the memory tool over a folder
+ai.clearToolUses = anthropic.ClearToolUses{atTokens: 100000}  // context editing
+let research = ai.chat()
+print(try research.say("What changed in the EU AI Act this year?"))
+for let (_, cite) in anthropic.citationsOf(research.messages()[1]) {
+	print("{cite.title}: {cite.url}")
+}
+try ai.compact(research)                                    // the conversation summed up
 ```
 
 A conversation is a `llm.Chat`. Each reply's content goes back to the API as it came (signed
@@ -40,6 +51,16 @@ call (`refusalFallback`). The client also covers `models`, `files` and `batches`
 `results`); `effort`, `display`, `thinkingBudget` (for models before Claude 4.6),
 `eagerToolInput`, `parallelToolCalls`, `userId`, `serviceTier` and `betas` are settings of the
 client.
+
+Server tools are settings too: `webSearch`, `webFetch` (with `filtering` for dynamic
+filtering on Claude 4.6 and later) and `codeExecution`, whose container the next request goes
+on in. `serverToolsOf(reply)` lists what they did, `citationsOf(reply)` what the reply cites
+(web pages, document characters, pages, blocks), `outputFilesOf(reply)` the files code wrote;
+commands and their output stream as text, and a turn the API pauses goes on in the same reply.
+`memory` offers Anthropic's memory tool over a folder (`memoryTool`); `computer` the computer
+use toolset over the program's own `Computer` (screenshots and actions). `clearToolUses` and
+`clearThinking` turn on context editing (`editsOf(reply)`), `compactAt` compaction at a size,
+and `compact(chat)` sums a conversation up on demand.
 
 ## Tests
 

@@ -227,6 +227,7 @@ partial module adm.ai.ollama {
 	// messages before it.
 	internal def messageOf(m Message, all Message[]) !map<string, any> {
 		fail RemoteError{message: "ollama: the chat API takes no sound; a message carries {m.audio.len()} recordings", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.audio.len() > 0
+		fail RemoteError{message: "ollama: the chat API takes no video; a message carries {m.videos.len()}", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.videos.len() > 0
 		fail RemoteError{message: "ollama: the server has no uploaded files; give the content as text, images or documents", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.files.len() > 0
 		let shown = withDocuments(m)
 		let out = map<string, any>{"role": roleName(m.role), "content": shown.text}

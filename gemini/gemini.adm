@@ -232,6 +232,19 @@ partial module adm.ai.gemini {
 			case Role.Tool:
 				let answer = map<string, any>{"name": callName(all, m.callId), "response": map<string, any>{"result": m.text}}
 				answer.set("id", m.callId) unless m.callId.startsWith("call_made_")
+				if m.images.len() > 0 {
+					// Gemini 3: the pictures as parts of the response, named in it.
+					let named any[] = []
+					let attached any[] = []
+					let encoder = new Base64()
+					for let (k, picture) in m.images {
+						let name = "{m.callId}-{k + 1}.png"
+						named.push(map<string, any>{"$ref": name})
+						attached.push(map<string, any>{"inlineData": map<string, any>{"mimeType": "image/png", "data": encoder.encode(try pngOf(picture)), "displayName": name}})
+					}
+					answer.set("response", map<string, any>{"result": m.text, "images": named})
+					answer.set("parts", attached)
+				}
 				let part = map<string, any>{"functionResponse": answer}
 				let joined = resultsContent(contents)
 				if joined is map<string, any> {
@@ -257,6 +270,9 @@ partial module adm.ai.gemini {
 				for let (_, file) in m.files {
 					parts.push(map<string, any>{"fileData": map<string, any>{"mimeType": file.mediaType, "fileUri": file.id}})
 				}
+				for let (_, clip) in m.videos {
+					parts.push(map<string, any>{"inlineData": map<string, any>{"mimeType": try videoType(clip.info().container), "data": codec.encode(try clip.bytes())}})
+				}
 				for let (_, doc) in m.documents {
 					parts.push(map<string, any>{"text": new docs.Markdown().encode(doc)})
 				}
@@ -264,6 +280,29 @@ partial module adm.ai.gemini {
 				contents.push(map<string, any>{"role": "user", "parts": parts})
 		}
 		return none
+	}
+
+	// The media type Gemini knows a video container by.
+	// Fails with RemoteError BadRequest for a container it does not read.
+	internal def videoType(container string) !string {
+		match container {
+			case "mp4", "mov":
+				return "video/mp4"
+			case "mpeg", "mpg", "ts":
+				return "video/mpeg"
+			case "avi":
+				return "video/avi"
+			case "flv":
+				return "video/x-flv"
+			case "webm":
+				return "video/webm"
+			case "asf", "wmv":
+				return "video/wmv"
+			case "3gp", "3gpp":
+				return "video/3gpp"
+			default:
+				fail RemoteError{message: "gemini: a {container} video is not one Gemini reads (mp4, mpeg, avi, flv, webm, wmv, 3gpp); upload it converted, or name it with `files`", code: "badrequest", kind: RemoteErrorKind.BadRequest}
+		}
 	}
 
 	// The last content when it holds function results, which the next

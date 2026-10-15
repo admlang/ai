@@ -1,0 +1,145 @@
+partial module adm.ai.anthropic {
+	use (
+		std.data.encoding::(json)
+		std.os
+		std.ai.llm::(Tool, ToolCall)
+	)
+
+	// The name and the version of Anthropic's memory tool.
+	const memoryName = "memory"
+	const memoryType = "memory_20250818"
+
+	// What the model writes to the memory tool.
+	internal struct MemoryCommand {
+		command string
+		path string = ""
+		@json(name = "file_text")
+		fileText string = ""
+		@json(name = "old_str")
+		oldStr string = ""
+		@json(name = "new_str")
+		newStr string = ""
+		@json(name = "insert_line")
+		insertLine int = 0
+		@json(name = "insert_text")
+		insertText string = ""
+		@json(name = "old_path")
+		oldPath string = ""
+		@json(name = "new_path")
+		newPath string = ""
+		@json(name = "view_range")
+		viewRange int[] = []
+	}
+
+	// Anthropic's memory tool over a folder: the model keeps notes in
+	// `/memories` (viewing, creating, editing, renaming and deleting files)
+	// and finds them in later conversations. `Client.memory` adds it to the
+	// conversations a client opens. Paths outside `/memories` are refused.
+	def memoryTool(folder string) Tool {
+		return Tool{name: memoryName, description: "Anthropic's memory tool", run: def (call ToolCall) !string {
+			let command = MemoryCommand{command: ""}
+			try call.decode(command)
+			return try runMemory(folder, command)
+		}}
+	}
+
+	// Runs one memory command on `folder`; the text the model reads.
+	// Fails with the error text the model reads (as the tool's error).
+	internal def runMemory(folder string, c MemoryCommand) !string {
+		match c.command {
+			case "view":
+				let path = try memoryPath(folder, c.path)
+				fail "The path {c.path} does not exist. Please provide a valid path." unless try os.exists(path)
+				let info = try os.stat(path, true)
+				if info.isDir {
+					let lines = string["{sizeText(info.size)}\t{c.path.trimEnd("/")}"]
+					for let (_, e) in try os.readDir(path, 1) {
+						let name = e.path.slice(path.len()).trimStart("/")
+						continue when name.startsWith(".") || name.contains("/.") || name.contains("node_modules")
+						lines.push("{sizeText(e.info.size)}\t{c.path.trimEnd("/")}/{name}")
+					}
+					return "Here're the files and directories up to 2 levels deep in {c.path}, excluding hidden items and node_modules:\n" + lines.join("\n")
+				}
+				let all = string(try os.readFile(path)).trimEnd("\n").split("\n")
+				fail "File {c.path} exceeds maximum line limit of 999,999 lines." when all.len() > 999999
+				let from = c.viewRange.len() == 2 ?? (c.viewRange[0].max(1), 1)
+				let to = c.viewRange.len() == 2 && c.viewRange[1] >= 0 ?? (c.viewRange[1].min(all.len()), all.len())
+				let shown string[]
+				for let n = from; n <= to; n++ {
+					shown.push("%6d".format(n) + "\t" + all[n - 1])
+				}
+				return "Here's the content of {c.path} with line numbers:\n" + shown.join("\n")
+			case "create":
+				let path = try memoryPath(folder, c.path)
+				try os.mkdir(os.dir(path), true)
+				try os.writeFile(path, c.fileText.bytes())
+				return "File created successfully at: {c.path}"
+			case "str_replace":
+				let path = try memoryPath(folder, c.path)
+				fail "Error: The path {c.path} does not exist. Please provide a valid path." unless try isFile(path)
+				let text = string(try os.readFile(path))
+				let first = text.indexOf(c.oldStr)
+				fail "No replacement was performed, old_str `{c.oldStr}` did not appear verbatim in {c.path}." when first < 0 || c.oldStr.len() == 0
+				let lines int[]
+				let at = first
+				for at >= 0 {
+					lines.push(text.slice(0, at).split("\n").len())
+					at = text.indexOf(c.oldStr, at + 1)
+				}
+				fail "No replacement was performed. Multiple occurrences of old_str `{c.oldStr}` in lines: {lines.join(", ")}. Please ensure it is unique" when lines.len() > 1
+				try os.writeFile(path, (text.slice(0, first) + c.newStr + text.slice(first + c.oldStr.len())).bytes())
+				return "The memory file has been edited."
+			case "insert":
+				let path = try memoryPath(folder, c.path)
+				fail "Error: The path {c.path} does not exist" unless try isFile(path)
+				let lines = string(try os.readFile(path)).split("\n")
+				fail "Error: Invalid `insert_line` parameter: {c.insertLine}. It should be within the range of lines of the file: [0, {lines.len()}]" when c.insertLine < 0 || c.insertLine > lines.len()
+				let edited = lines[:c.insertLine].clone()
+				edited.push(c.insertText.trimEnd("\n"))
+				edited.push(...lines[c.insertLine:])
+				try os.writeFile(path, edited.join("\n").bytes())
+				return "The file {c.path} has been edited."
+			case "delete":
+				let path = try memoryPath(folder, c.path)
+				fail "Error: The memory directory itself cannot be deleted" when path == os.clean(folder)
+				fail "Error: The path {c.path} does not exist" unless try os.exists(path)
+				try os.remove(path, true)
+				return "Successfully deleted {c.path}"
+			case "rename":
+				let from = try memoryPath(folder, c.oldPath)
+				let to = try memoryPath(folder, c.newPath)
+				fail "Error: The memory directory itself cannot be renamed" when from == os.clean(folder)
+				fail "Error: The path {c.oldPath} does not exist" unless try os.exists(from)
+				fail "Error: The destination {c.newPath} already exists" when try os.exists(to)
+				try os.mkdir(os.dir(to), true)
+				try os.rename(from, to)
+				return "Successfully renamed {c.oldPath} to {c.newPath}"
+			default:
+				fail "Error: unknown command {c.command}"
+		}
+	}
+
+	// The file a memory path names inside `folder`.
+	// Fails for a path outside `/memories` (traversals included).
+	internal def memoryPath(folder string, path string) !string {
+		let decoded = path.replace("%2e", ".", -1).replace("%2E", ".", -1).replace("%2f", "/", -1).replace("%2F", "/", -1)
+		fail "Error: The path {path} is outside /memories" unless decoded == "/memories" || decoded.startsWith("/memories/")
+		fail "Error: The path {path} is outside /memories" when decoded.contains("..") || decoded.contains("\\")
+		let rest = decoded.slice("/memories".len()).trimStart("/")
+		try os.mkdir(folder, true)
+		return rest.len() == 0 ?? (os.clean(folder), os.join(folder, rest))
+	}
+
+	internal def isFile(path string) !bool {
+		return false unless try os.exists(path)
+		return !(try os.stat(path, true)).isDir
+	}
+
+	// A size as the memory tool shows it: 512, 4.0K, 1.2M.
+	internal def sizeText(size int64) string {
+		let n = float(size)
+		return "{size}" when n < 1024.0
+		return "%.1fK".format(n / 1024.0) when n < 1024.0 * 1024.0
+		return "%.1fM".format(n / (1024.0 * 1024.0))
+	}
+}

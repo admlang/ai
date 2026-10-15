@@ -2,7 +2,7 @@ partial module adm.ai.gemini {
 	use (
 		std.net.http
 		std.data.encoding::(JSON)
-		std.ai.llm::(ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, ToolCall, Message)
+		std.ai.llm::(ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, ToolCall, Message, Role)
 	)
 
 	// A web page a grounded reply drew on.
@@ -60,8 +60,8 @@ partial module adm.ai.gemini {
 	// signatures among them, for the reply's `Message.providerState`.
 	// Implements `llm.ReplyStream`.
 	internal type ContentStream {
-		internal res       http.Response
-		internal events    http.EventReader
+		internal res       ?http.Response
+		internal events    ?http.EventReader
 		internal pending   ReplyEvent[]
 		internal ended     bool
 		internal parts     any[]
@@ -71,9 +71,9 @@ partial module adm.ai.gemini {
 		internal blocked   bool
 		internal used      Usage
 
-		def new(res http.Response) {
+		def new(res ?http.Response) {
 			self.res = res
-			events = new http.EventReader(res.body)
+			events = res is none ?? (none, new http.EventReader(res.body))
 		}
 
 		// The next event; none after `Done`.
@@ -82,7 +82,9 @@ partial module adm.ai.gemini {
 		def next() !?ReplyEvent {
 			for pending.len() == 0 {
 				return none when ended
-				let event = events.next() onerror (err error) {
+				let reader = events
+				fail RemoteError{message: "gemini: the reply has no stream", code: "protocol", kind: RemoteErrorKind.Protocol} when reader is none
+				let event = reader.next() onerror (err error) {
 					close()
 					fail RemoteError{message: "gemini: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
 				}
@@ -104,7 +106,10 @@ partial module adm.ai.gemini {
 		// Stops reading the reply.
 		def close() {
 			ended = true
-			res.close() onerror recover none
+			let open = res
+			if open is http.Response {
+				open.close() onerror recover none
+			}
 		}
 
 		internal def take(data string) !none {
@@ -113,6 +118,12 @@ partial module adm.ai.gemini {
 				fail RemoteError{message: "gemini: an event is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
 			}
 			return none unless parsed is map<string, any>
+			return try takeChunk(parsed)
+		}
+
+		// One chunk of the reply, or a whole reply (a batch's answer).
+		// Fails with RemoteError when it reports an error.
+		def takeChunk(parsed map<string, any>) !none {
 			let error = objectAt(parsed, "error")
 			if error.len() > 0 {
 				close()
@@ -155,8 +166,8 @@ partial module adm.ai.gemini {
 			return none
 		}
 
-		// The end, once the stream is done.
-		internal def conclude() {
+		// The end, once the stream is done (or the whole reply was taken).
+		def conclude() {
 			let state = map<string, any>{"parts": parts}
 			state.set("grounding", grounding) unless grounding is none
 			let stop = StopReason.End
@@ -172,5 +183,36 @@ partial module adm.ai.gemini {
 			pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: used, state: partsState + string((new JSON()).encode(state))})
 			close()
 		}
+	}
+
+	// A whole reply of generateContent (a batch's answer) as a message,
+	// with its usage and why it stopped.
+	// Fails with RemoteError when the reply reports an error.
+	internal def replyOf(response map<string, any>) !(Message, Usage, StopReason) {
+		let reader = new ContentStream(none)
+		try reader.takeChunk(response)
+		reader.conclude()
+		let message = Message{role: Role.Assistant}
+		let used = Usage{}
+		let stop = StopReason.End
+		for {
+			let next = try reader.next()
+			break when next is none
+			let event = next
+			match event.kind {
+				case ReplyEventKind.Text:
+					message.text += event.text
+				case ReplyEventKind.Thinking:
+					message.thinking += event.text
+				case ReplyEventKind.Call:
+					let call = event.call
+					message.calls.push(call) unless call is none
+				case ReplyEventKind.Done:
+					used = event.usage
+					stop = event.stop
+					message.providerState = event.state
+			}
+		}
+		return (message, used, stop)
 	}
 }

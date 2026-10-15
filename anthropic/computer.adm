@@ -1,0 +1,106 @@
+partial module adm.ai.anthropic {
+	use (
+		std.data.encoding::(json)
+		std.math.geom
+		std.formats.image::(Image)
+		std.ai.llm::(Tool, ToolCall, ToolOutput)
+	)
+
+	// The computer use toolset's type and name.
+	const computerType = "computer_toolset_20260801"
+	const computerName = "computer"
+
+	// The actions of the computer use toolset, each a call of its own name.
+	const computerActions = ["screenshot", "zoom", "left_click", "right_click", "middle_click", "double_click", "triple_click", "left_click_drag", "mouse_move", "left_mouse_down", "left_mouse_up", "cursor_position", "scroll", "type", "key", "hold_key", "wait"]
+
+	// One thing the model does on the screen, as `Computer.act` gets it.
+	struct ComputerAction {
+		// left_click, right_click, middle_click, double_click, triple_click,
+		// left_click_drag, mouse_move, left_mouse_down, left_mouse_up,
+		// cursor_position, scroll, type, key, hold_key or wait.
+		action    string
+		// Where, in the screenshot's pixels; -1 when the action names no
+		// place (a click where the pointer is).
+		x         int    = -1
+		y         int    = -1
+		// Where a drag starts.
+		fromX     int    = -1
+		fromY     int    = -1
+		// The text typed, the key or chord ("ctrl+s"), or the keys held
+		// during a click or scroll.
+		text      string = ""
+		// Scrolling: up, down, left or right, and how far.
+		direction string = ""
+		amount    int    = 0
+		// How often a key is pressed.
+		repeat    int    = 1
+		// Seconds a key is held, or waited.
+		seconds   float  = 0.0
+	}
+
+	// What carries out the model's actions on a screen: the program's
+	// own, since std drives no desktop (an X11 or Wayland session, a
+	// virtual machine, a browser). `Client.computer` offers it to the
+	// model as Anthropic's computer use toolset.
+	interface Computer {
+		// A picture of the screen now; its pixels are the coordinates the
+		// model uses.
+		def screenshot() !Image
+		// Carries out `action`; the text the model reads ("" reads as OK).
+		def act(action ComputerAction) !string
+	}
+
+	// What the model writes for an action.
+	internal struct ComputerInput {
+		coordinate int[] = []
+		@json(name = "start_coordinate")
+		startCoordinate int[] = []
+		region int[] = []
+		text string = ""
+		@json(name = "scroll_direction")
+		scrollDirection string = ""
+		@json(name = "scroll_amount")
+		scrollAmount int = 0
+		repeat int = 1
+		duration float = 0.0
+	}
+
+	// A tool per action of the toolset, run on `computer`: screenshots and
+	// zooms come back as pictures, the rest as text.
+	def computerTools(computer Computer) Tool[] {
+		let out Tool[]
+		for let (_, name) in computerActions {
+			out.push(Tool{name: name, description: "Anthropic's computer use action {name}", look: def (call ToolCall) !ToolOutput {
+				return try runComputer(computer, call)
+			}})
+		}
+		return out
+	}
+
+	internal def runComputer(computer Computer, call ToolCall) !ToolOutput {
+		let input = ComputerInput{}
+		try call.decode(input)
+		match call.name {
+			case "screenshot":
+				return ToolOutput{text: "", images: [try computer.screenshot()]}
+			case "zoom":
+				fail "zoom needs a region of four numbers" unless input.region.len() == 4
+				let shot = try computer.screenshot()
+				let r = input.region
+				let part = shot.subImage(new geom.Rectangle(position = new geom.Point(float(r[0]), float(r[1])), size = new geom.Size(float(r[2] - r[0]), float(r[3] - r[1]))))
+				return ToolOutput{text: "", images: [part]}
+			default:
+				let action = ComputerAction{action: call.name, text: input.text, direction: input.scrollDirection, amount: input.scrollAmount, repeat: input.repeat, seconds: input.duration}
+				if input.coordinate.len() == 2 {
+					action.x = input.coordinate[0]
+					action.y = input.coordinate[1]
+				}
+				if input.startCoordinate.len() == 2 {
+					action.fromX = input.startCoordinate[0]
+					action.fromY = input.startCoordinate[1]
+				}
+				let said = try computer.act(action)
+				return ToolOutput{text: said.len() > 0 ?? (said, "OK")}
+		}
+	}
+}

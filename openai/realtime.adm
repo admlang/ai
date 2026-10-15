@@ -1,0 +1,221 @@
+partial module adm.ai.openai {
+	use (
+		std.sync
+		std.net.url
+		std.net.http
+		std.net.http::(Header)
+		std.net.http.websocket
+		std.net.http.websocket::(Conn, DialOptions, WebSocketError)
+		std.data.encoding::(JSON, Base64)
+		std.formats.audio
+		std.formats.audio::(Audio, AudioInfo, SampleFormat)
+		std.formats.image::(Image)
+		std.ai.llm::(LiveChat, LiveSetup, LiveConnection, LiveEvent, LiveEventKind, ToolCall, ToolOutput, Usage, RemoteError, RemoteErrorKind, schemaOf)
+	)
+
+	// The rate the Realtime API's PCM sound runs at, both ways.
+	const realtimeRate = 24000
+
+	partial type Client {
+		// A live spoken conversation over the Realtime API with `model`
+		// ("gpt-realtime"). It is a `llm.LiveChat`.
+		def live(model string = "gpt-realtime") LiveChat {
+			return new LiveChat(self, model)
+		}
+
+		// Opens a Realtime connection with `setup`: what `LiveChat` calls.
+		// Implements `llm.LiveProvider`.
+		// Fails with RemoteError when the connection or the session is
+		// refused.
+		def connect(setup LiveSetup) !LiveConnection {
+			let base = baseURL.startsWith("https://") ?? ("wss://" + baseURL.slice(8), baseURL.startsWith("http://") ?? ("ws://" + baseURL.slice(7), baseURL))
+			let headers = new Header()
+			let key = apiKey
+			headers.set("Authorization", "Bearer " + key.reveal()) unless key is none
+			headers.set("OpenAI-Organization", organization) when organization.len() > 0
+			headers.set("OpenAI-Project", project) when project.len() > 0
+			let (conn, _) = websocket.dial("{base}/realtime?model={url.queryEscape(setup.model)}", DialOptions{headers: headers}) onerror (err error) {
+				fail RemoteError{message: "openai: the Realtime API cannot be reached: {err}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+			}
+			let live = new RealtimeConnection(conn)
+			try live.write(map<string, any>{"type": "session.update", "session": sessionOf(setup)})
+			return live
+		}
+	}
+
+	// The session a Realtime connection opens with.
+	internal def sessionOf(setup LiveSetup) map<string, any> {
+		let format = map<string, any>{"type": "audio/pcm", "rate": realtimeRate}
+		let input = map<string, any>{"format": format}
+		input.set("turn_detection", setup.turns ?? (map<string, any>{"type": "server_vad"}, none))
+		input.set("transcription", map<string, any>{"model": "gpt-4o-mini-transcribe"}) when setup.transcribe
+		let output = map<string, any>{"format": format}
+		output.set("voice", setup.voice) when setup.voice.len() > 0
+		let session = map<string, any>{"type": "realtime", "model": setup.model, "output_modalities": any[setup.speech ?? ("audio", "text")], "audio": map<string, any>{"input": input, "output": output}}
+		session.set("instructions", setup.system) when setup.system.len() > 0
+		if setup.tools.len() > 0 {
+			let tools any[] = []
+			for let (_, t) in setup.tools {
+				tools.push(map<string, any>{"type": "function", "name": t.name, "description": t.description, "parameters": schemaOf(t)})
+			}
+			session.set("tools", tools)
+		}
+		return session
+	}
+
+	// An open Realtime connection: client events written as JSON text
+	// messages (under a lock, from any task), server events read by one.
+	// Implements `llm.LiveConnection`.
+	internal type RealtimeConnection {
+		internal conn      Conn
+		internal lock      sync.Mutex
+		internal converter ?audio.Converter = none
+		internal pending   LiveEvent[]
+		internal closed    bool
+
+		def new(conn Conn) {
+			self.conn = conn
+			lock = new sync.Mutex()
+		}
+
+		// Sends a piece of the user's sound, resampled to 24 kHz mono.
+		// Fails when the connection does.
+		def send(sound Audio) !none {
+			let rate = int(sound.info.sampleRate)
+			let channels = int(sound.info.channels).max(1)
+			let made = converter
+			let current = made is none || made.fromRate != rate || made.fromChannels != channels ?? (new audio.Converter(rate, channels, realtimeRate, 1), made)
+			converter = current
+			let samples = current.convert(sound.samples)
+			return none when samples.len() == 0
+			return try write(map<string, any>{"type": "input_audio_buffer.append", "audio": (new Base64()).encode(pcm16Of(samples))})
+		}
+
+		// Sends a user message and asks for a reply.
+		// Fails when the connection does.
+		def send(text string, images Image[]) !none {
+			let content any[] = []
+			content.push(map<string, any>{"type": "input_text", "text": text}) when text.len() > 0
+			for let (_, picture) in images {
+				content.push(map<string, any>{"type": "input_image", "image_url": try imageURL(picture)})
+			}
+			try write(map<string, any>{"type": "conversation.item.create", "item": map<string, any>{"type": "message", "role": "user", "content": content}})
+			return try write(map<string, any>{"type": "response.create"})
+		}
+
+		// Ends the spoken turn and asks for a reply, the resampler's last
+		// samples sent first.
+		// Fails when the connection does.
+		def commit() !none {
+			// What the resampler still holds belongs to this turn.
+			let made = converter
+			if !(made is none) {
+				let rest = made.flush()
+				try write(map<string, any>{"type": "input_audio_buffer.append", "audio": (new Base64()).encode(pcm16Of(rest))}) when rest.len() > 0
+				converter = none
+			}
+			try write(map<string, any>{"type": "input_audio_buffer.commit"})
+			return try write(map<string, any>{"type": "response.create"})
+		}
+
+		// Gives a call's result and asks the model to go on; its pictures
+		// follow as a user message.
+		// Fails when the connection does.
+		def answer(call ToolCall, output ToolOutput) !none {
+			try write(map<string, any>{"type": "conversation.item.create", "item": map<string, any>{"type": "function_call_output", "call_id": call.id, "output": output.text}})
+			if output.images.len() > 0 {
+				let content any[] = []
+				for let (_, picture) in output.images {
+					content.push(map<string, any>{"type": "input_image", "image_url": try imageURL(picture)})
+				}
+				try write(map<string, any>{"type": "conversation.item.create", "item": map<string, any>{"type": "message", "role": "user", "content": content}})
+			}
+			return try write(map<string, any>{"type": "response.create"})
+		}
+
+		// The next event; none once the connection closed.
+		// Fails with RemoteError when the API reports an error.
+		def next() !?LiveEvent {
+			for pending.len() == 0 {
+				return none when closed
+				let text = conn.readText() onerror (err error) {
+					closed = true
+					// A normal close ends the conversation; any other says why.
+					return none when err is WebSocketError && err.kind == websocket.ErrorKind.Closed && err.closeCode == int(websocket.CloseCode.Normal)
+					fail RemoteError{message: "openai: the live connection ended: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+				}
+				try take(text)
+			}
+			let event = pending[0]
+			pending.remove(0)
+			return event
+		}
+
+		def close() {
+			closed = true
+			conn.close() onerror recover none
+		}
+
+		// Writes one client event.
+		// Fails with RemoteError Transport when the connection broke.
+		def write(event map<string, any>) !none {
+			lock.lock()
+			defer lock.unlock()
+			conn.writeText(string((new JSON()).encode(event))) onerror (err error) {
+				fail RemoteError{message: "openai: the Realtime connection broke: {err}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+			}
+			return none
+		}
+
+		internal def take(text string) !none {
+			let parsed = (new JSON()).parse(text) onerror recover none
+			return none unless parsed is map<string, any>
+			match textAt(parsed, "type") {
+				case "response.output_audio.delta":
+					let data = try (new Base64()).decode(textAt(parsed, "delta"))
+					pending.push(LiveEvent{kind: LiveEventKind.Sound, sound: audioOf(data, realtimeRate)}) when data.len() > 1
+				case "response.output_audio_transcript.delta", "response.output_text.delta":
+					let piece = textAt(parsed, "delta")
+					pending.push(LiveEvent{kind: LiveEventKind.Text, text: piece}) when piece.len() > 0
+				case "conversation.item.input_audio_transcription.completed":
+					pending.push(LiveEvent{kind: LiveEventKind.Heard, text: textAt(parsed, "transcript")})
+				case "input_audio_buffer.speech_started":
+					pending.push(LiveEvent{kind: LiveEventKind.Interrupted})
+				case "response.function_call_arguments.done":
+					pending.push(LiveEvent{kind: LiveEventKind.Call, call: new ToolCall(textAt(parsed, "call_id"), textAt(parsed, "name"), textAt(parsed, "arguments"))})
+				case "response.done":
+					let usage = objectAt(objectAt(parsed, "response"), "usage")
+					pending.push(LiveEvent{kind: LiveEventKind.Done, usage: Usage{inputTokens: intAt(usage, "input_tokens"), outputTokens: intAt(usage, "output_tokens"), cachedTokens: intAt(objectAt(usage, "input_token_details"), "cached_tokens")}})
+				case "error":
+					let error = objectAt(parsed, "error")
+					fail failedError(textAt(error, "code"), textAt(error, "message"))
+				default:
+			}
+			return none
+		}
+	}
+
+	// Samples from -1 to 1 as 16-bit little-endian PCM.
+	internal def pcm16Of(samples float32[]) byte[] {
+		let out byte[]
+		out.len(samples.len() * 2)
+		for let (i, s) in samples {
+			let v = int(float(s).clamp(-1.0, 1.0) * 32767.0)
+			out[2 * i] = byte(v & 0xFF)
+			out[2 * i + 1] = byte((v >> 8) & 0xFF)
+		}
+		return out
+	}
+
+	// 16-bit little-endian mono PCM at `rate` as a sound.
+	internal def audioOf(data byte[], rate int) Audio {
+		let frames = data.len() / 2
+		let samples float32[]
+		samples.len(frames)
+		for let i = 0; i < frames; i++ {
+			let v = int(data[2 * i]) | (int(data[2 * i + 1]) << 8)
+			samples[i] = float32(float(v >= 32768 ?? (v - 65536, v)) / 32768.0)
+		}
+		return Audio{info: AudioInfo{sampleRate: uint32(rate), channels: uint16(1), bitDepth: uint16(16), format: SampleFormat.Int16, frames: uint64(frames)}, samples: samples}
+	}
+}

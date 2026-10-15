@@ -8,18 +8,32 @@ partial module adm.ai.anthropic {
 	// The reply of /messages as it streams (server-sent events). Each
 	// content block is rebuilt from its deltas: the whole list goes into
 	// the reply's `Message.providerState` and back to the API unchanged, as
-	// signed thinking must. Implements `llm.ReplyStream`.
+	// signed thinking must. A turn the API pauses (`pause_turn`, a long
+	// server tool run) is sent back and goes on in the same reply. Implements
+	// `llm.ReplyStream`.
 	internal type MessageStream {
-		internal res     http.Response
-		internal events  http.EventReader
-		internal pending ReplyEvent[]
-		internal ended   bool
-		internal blocks  map<string, any>[]
-		internal inputs  map<int, string>
-		internal used    Usage
-		internal reason  string
+		internal client    Client
+		internal body      map<string, any>
+		internal betas     string[]
+		internal res       http.Response
+		internal events    http.EventReader
+		internal pending   ReplyEvent[]
+		internal ended     bool
+		internal blocks    map<string, any>[]
+		internal inputs    map<int, string>
+		internal used      Usage
+		internal before    Usage
+		internal reason    string
+		// Where this response's blocks start among the reply's (after the
+		// blocks of the responses before a pause).
+		internal base      int
+		internal container string
+		internal edits     any[]
 
-		def new(res http.Response) {
+		def new(client Client, body map<string, any>, betas string[], res http.Response) {
+			self.client = client
+			self.body = body
+			self.betas = betas
 			self.res = res
 			events = new http.EventReader(res.body)
 			inputs = new map<int, string>()
@@ -60,24 +74,41 @@ partial module adm.ai.anthropic {
 			return none unless parsed is map<string, any>
 			match textAt(parsed, "type") {
 				case "message_start":
-					count(objectAt(objectAt(parsed, "message"), "usage"))
+					let message = objectAt(parsed, "message")
+					count(objectAt(message, "usage"))
+					keepContainer(message.get("container"))
 				case "content_block_start":
-					let at = intAt(parsed, "index")
+					let at = base + intAt(parsed, "index")
 					for blocks.len() <= at {
 						blocks.push(new map<string, any>())
 					}
-					blocks[at] = objectAt(parsed, "content_block")
+					let block = objectAt(parsed, "content_block")
+					blocks[at] = block
+					showResult(block)
 				case "content_block_delta":
-					try delta(intAt(parsed, "index"), objectAt(parsed, "delta"))
+					try delta(base + intAt(parsed, "index"), objectAt(parsed, "delta"))
 				case "content_block_stop":
-					finishBlock(intAt(parsed, "index"))
+					finishBlock(base + intAt(parsed, "index"))
 				case "message_delta":
-					let said = textAt(objectAt(parsed, "delta"), "stop_reason")
+					let change = objectAt(parsed, "delta")
+					let said = textAt(change, "stop_reason")
 					reason = said when said.len() > 0
 					count(objectAt(parsed, "usage"))
+					keepContainer(change.get("container"))
+					let managed = parsed.get("context_management")
+					if managed is map<string, any> {
+						edits.push(...listAt(managed, "applied_edits"))
+					}
 				case "message_stop":
-					let state = blocksState + string((new JSON()).encode(blocks))
-					pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stopOf(reason), usage: used, state: state})
+					if reason == "pause_turn" {
+						try resume()
+						return none
+					}
+					let state = map<string, any>{"blocks": blocks}
+					state.set("container", container) when container.len() > 0
+					state.set("edits", edits) when edits.len() > 0
+					add(used, before)
+					pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stopOf(reason), usage: used, state: blocksState + string((new JSON()).encode(state))})
 					close()
 				case "error":
 					close()
@@ -104,6 +135,8 @@ partial module adm.ai.anthropic {
 				case "input_json_delta":
 					let held = inputs.get(at)
 					inputs.set(at, (held is none ?? ("", held)) + textAt(change, "partial_json"))
+				case "compaction_delta":
+					block.set("content", textAt(block, "content") + textAt(change, "content"))
 				case "citations_delta":
 					let list = listAt(block, "citations")
 					let citation = change.get("citation")
@@ -114,17 +147,61 @@ partial module adm.ai.anthropic {
 			return none
 		}
 
-		// A finished tool_use block gets its input; the call is reported.
+		// A finished tool_use or server_tool_use block gets its input; a
+		// call is reported, a command code execution runs is shown.
 		internal def finishBlock(at int) {
 			return unless at >= 0 && at < blocks.len()
 			let block = blocks[at]
-			return unless textAt(block, "type") == "tool_use"
+			let kind = textAt(block, "type")
+			return unless kind := "tool_use" || "server_tool_use"
 			let held = inputs.get(at)
 			let text = held is none ?? ("", held)
 			let arguments = text.trim().len() == 0 ?? ("\{}", text)
 			let input = (new JSON()).parse(arguments) onerror recover none
-			block.set("input", input is none ?? (new map<string, any>(), input))
-			pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(textAt(block, "id"), textAt(block, "name"), arguments)})
+			let decoded = input is map<string, any> ?? (input, new map<string, any>())
+			block.set("input", decoded)
+			if kind == "tool_use" {
+				pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(textAt(block, "id"), textAt(block, "name"), arguments)})
+			} else if textAt(block, "name") == "bash_code_execution" {
+				pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "\n```bash\n{textAt(decoded, "command")}\n```\n"})
+			} else if textAt(block, "name") == "text_editor_code_execution" && textAt(decoded, "command") == "create" {
+				pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "\n`{textAt(decoded, "path")}`:\n```\n{textAt(decoded, "file_text")}\n```\n"})
+			}
+		}
+
+		// The output of a command code execution ran, shown as text.
+		internal def showResult(block map<string, any>) {
+			return unless textAt(block, "type") == "bash_code_execution_tool_result"
+			let result = objectAt(block, "content")
+			let out = textAt(result, "stdout") + textAt(result, "stderr")
+			pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "\n```\n{out.trimEnd("\n")}\n```\n"}) when out.len() > 0
+		}
+
+		internal def keepContainer(value ?any) {
+			if value is map<string, any> {
+				let id = textAt(value, "id")
+				container = id when id.len() > 0
+			} else if value is string && value.len() > 0 {
+				container = value
+			}
+		}
+
+		// Sends the paused turn back and reads on: the API goes on with it,
+		// its blocks after the ones so far.
+		internal def resume() !none {
+			res.close() onerror recover none
+			let messages = listAt(body, "messages")
+			messages.push(map<string, any>{"role": "assistant", "content": blocks.clone()})
+			body.set("messages", messages)
+			body.set("container", container) when container.len() > 0
+			add(before, used)
+			used = Usage{}
+			reason = ""
+			inputs = new map<int, string>()
+			base = blocks.len()
+			res = try post(client, "/messages", body, betas)
+			events = new http.EventReader(res.body)
+			return none
 		}
 
 		// Adds the counts of a message_start or message_delta usage: the
@@ -140,6 +217,15 @@ partial module adm.ai.anthropic {
 			let output = intAt(usage, "output_tokens")
 			used.outputTokens = output when output > 0
 		}
+	}
+
+	// Adds the counts of `part` to `sum`.
+	internal def add(sum Usage, part Usage) {
+		sum.inputTokens += part.inputTokens
+		sum.outputTokens += part.outputTokens
+		sum.cachedTokens += part.cachedTokens
+		sum.cacheWriteTokens += part.cacheWriteTokens
+		sum.thinkingTokens += part.thinkingTokens
 	}
 
 	// The stop reason of the API as a `StopReason`.

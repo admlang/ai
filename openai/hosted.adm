@@ -1,0 +1,309 @@
+partial module adm.ai.openai {
+	use (
+		std.data.encoding::(JSON, Base64)
+		std.formats.image
+		std.formats.image::(Image)
+		std.ai.llm::(Message, RemoteError, RemoteErrorKind)
+	)
+
+	// Where a web search is localized.
+	struct Location {
+		city     string = ""
+		region   string = ""
+		// Two letters, ISO 3166-1 alpha-2.
+		country  string = ""
+		// An IANA time zone ("Europe/Oslo").
+		timezone string = ""
+	}
+
+	// The web search OpenAI runs for the model (`Client.webSearch`,
+	// Responses API).
+	struct WebSearch {
+		// How much of the pages the model reads: "low", "medium", "high";
+		// "" for the API's default.
+		contextSize    string    = ""
+		location       ?Location = none
+		// Only these domains.
+		allowedDomains string[]  = []
+	}
+
+	// The search over vector stores OpenAI runs for the model
+	// (`Client.fileSearch`).
+	struct FileSearch {
+		// The vector stores searched (`vectorStores.create`).
+		vectorStores string[]
+		// Passages it hands the model at most; 0 for the API's default.
+		maxResults   int      = 0
+	}
+
+	// The Python sandbox OpenAI runs for the model (`Client.codeInterpreter`).
+	struct CodeInterpreter {
+		// Files uploaded with purpose "user_data" the code may read.
+		files  string[] = []
+		// "1g", "4g", "16g" or "64g"; "" for the API's default.
+		memory string   = ""
+	}
+
+	// A remote MCP server whose tools OpenAI calls for the model
+	// (`Client.mcpServers`). Calls run without asking.
+	struct McpServer {
+		// A name for the server, unique among them.
+		label         string
+		url           string
+		// An OAuth access token for the server; none for none.
+		authorization ?Secret<string>   = none
+		headers       map<string, string> = map<string, string>{}
+		// The tools offered; empty for every tool.
+		allowedTools  string[]          = []
+		description   string            = ""
+	}
+
+	// The images OpenAI makes for the model (`Client.imageGeneration`);
+	// `imagesOf(reply)` reads them.
+	struct ImageGeneration {
+		// "1024x1024", "1024x1536", "1536x1024" or "auto"; "" for the
+		// API's default.
+		size       string = ""
+		// "low", "medium", "high" or "auto".
+		quality    string = ""
+		// "transparent", "opaque" or "auto".
+		background string = ""
+	}
+
+	// What a citation points at.
+	enum CitationKind {
+		// A web page.
+		Url,
+		// A file of a vector store.
+		File,
+		// A file code ran in a container wrote.
+		ContainerFile,
+	}
+
+	// A source the reply's text cites.
+	struct Citation {
+		kind      CitationKind
+		url       string = ""
+		title     string = ""
+		fileId    string = ""
+		filename  string = ""
+		container string = ""
+		// Characters of the reply's text the citation covers (a file
+		// citation marks a place: start and end are the same).
+		start     int    = 0
+		end       int    = 0
+	}
+
+	// One run of a hosted tool during a reply.
+	struct HostedRun {
+		// web_search, file_search, code_interpreter, image_generation, mcp,
+		// mcp_list_tools.
+		tool   string
+		// What it was asked: the search query, the code, the MCP tool's name
+		// and arguments as JSON.
+		input  string
+		// What it gave: the code's logs, the MCP tool's output, the file
+		// search's results as JSON.
+		output string
+		// Why it failed; "" when it ran.
+		error  string
+	}
+
+	// A token the model wrote, how likely it was, and the likeliest
+	// tokens it could have written there (`Client.logprobs`).
+	struct TokenLogprob {
+		token        string
+		logprob      float
+		alternatives string[] = []
+		likelihoods  float[]  = []
+	}
+
+	// The hosted tools a client offers, as /responses takes them.
+	// Fails with RemoteError BadRequest for an MCP server without a label
+	// or address.
+	internal def hostedTools(client Client) !any[] {
+		let out any[] = []
+		let search = client.webSearch
+		if !(search is none) {
+			let tool = map<string, any>{"type": "web_search"}
+			tool.set("search_context_size", search.contextSize) when search.contextSize.len() > 0
+			tool.set("filters", map<string, any>{"allowed_domains": texts(search.allowedDomains)}) when search.allowedDomains.len() > 0
+			let place = search.location
+			if !(place is none) {
+				let area = map<string, any>{"type": "approximate"}
+				area.set("city", place.city) when place.city.len() > 0
+				area.set("region", place.region) when place.region.len() > 0
+				area.set("country", place.country) when place.country.len() > 0
+				area.set("timezone", place.timezone) when place.timezone.len() > 0
+				tool.set("user_location", area)
+			}
+			out.push(tool)
+		}
+		let files = client.fileSearch
+		if !(files is none) {
+			let tool = map<string, any>{"type": "file_search", "vector_store_ids": texts(files.vectorStores)}
+			tool.set("max_num_results", files.maxResults) when files.maxResults > 0
+			out.push(tool)
+		}
+		let code = client.codeInterpreter
+		if !(code is none) {
+			let container = map<string, any>{"type": "auto"}
+			container.set("file_ids", texts(code.files)) when code.files.len() > 0
+			container.set("memory_limit", code.memory) when code.memory.len() > 0
+			out.push(map<string, any>{"type": "code_interpreter", "container": container})
+		}
+		for let (_, server) in client.mcpServers {
+			fail RemoteError{message: "openai: an MCP server needs a label and an address", code: "badrequest", kind: RemoteErrorKind.BadRequest} when server.label.len() == 0 || server.url.len() == 0
+			let tool = map<string, any>{"type": "mcp", "server_label": server.label, "server_url": server.url, "require_approval": "never"}
+			let token = server.authorization
+			tool.set("authorization", token.reveal()) unless token is none
+			if server.headers.len() > 0 {
+				let headers = new map<string, any>()
+				for let (k, v) in server.headers {
+					headers.set(k, v)
+				}
+				tool.set("headers", headers)
+			}
+			tool.set("allowed_tools", texts(server.allowedTools)) when server.allowedTools.len() > 0
+			tool.set("server_description", server.description) when server.description.len() > 0
+			out.push(tool)
+		}
+		let images = client.imageGeneration
+		if !(images is none) {
+			let tool = map<string, any>{"type": "image_generation"}
+			tool.set("size", images.size) when images.size.len() > 0
+			tool.set("quality", images.quality) when images.quality.len() > 0
+			tool.set("background", images.background) when images.background.len() > 0
+			out.push(tool)
+		}
+		return out
+	}
+
+	// Whether a client offers any hosted tool (which only the Responses API
+	// runs).
+	internal def offersHosted(client Client) bool {
+		return !(client.webSearch is none) || !(client.fileSearch is none) || !(client.codeInterpreter is none) || client.mcpServers.len() > 0 || !(client.imageGeneration is none)
+	}
+
+	// The citations of a reply of this library; empty for another message.
+	def citationsOf(reply Message) Citation[] {
+		let out Citation[]
+		for let (_, item) in itemsOf(reply) {
+			continue unless item is map<string, any> && textAt(item, "type") == "message"
+			for let (_, part) in listAt(item, "content") {
+				continue unless part is map<string, any>
+				for let (_, a) in listAt(part, "annotations") {
+					continue unless a is map<string, any>
+					match textAt(a, "type") {
+						case "url_citation":
+							out.push(Citation{kind: CitationKind.Url, url: textAt(a, "url"), title: textAt(a, "title"), start: intAt(a, "start_index"), end: intAt(a, "end_index")})
+						case "file_citation":
+							out.push(Citation{kind: CitationKind.File, fileId: textAt(a, "file_id"), filename: textAt(a, "filename"), start: intAt(a, "index"), end: intAt(a, "index")})
+						case "container_file_citation":
+							out.push(Citation{kind: CitationKind.ContainerFile, fileId: textAt(a, "file_id"), filename: textAt(a, "filename"), container: textAt(a, "container_id"), start: intAt(a, "start_index"), end: intAt(a, "end_index")})
+						default:
+					}
+				}
+			}
+		}
+		return out
+	}
+
+	// The hosted tools that ran during a reply of this library, in order.
+	def hostedRunsOf(reply Message) HostedRun[] {
+		let out HostedRun[]
+		let codec = new JSON()
+		for let (_, item) in itemsOf(reply) {
+			continue unless item is map<string, any>
+			let failed = textAt(item, "status") == "failed" ?? ("failed", "")
+			match textAt(item, "type") {
+				case "web_search_call":
+					let action = objectAt(item, "action")
+					out.push(HostedRun{tool: "web_search", input: textAt(action, "query"), output: string(codec.encode(listAt(action, "sources"))), error: failed})
+				case "file_search_call":
+					out.push(HostedRun{tool: "file_search", input: string(codec.encode(listAt(item, "queries"))), output: string(codec.encode(listAt(item, "results"))), error: failed})
+				case "code_interpreter_call":
+					let logs = ""
+					for let (_, o) in listAt(item, "outputs") {
+						logs += textAt(o, "logs") when o is map<string, any>
+					}
+					out.push(HostedRun{tool: "code_interpreter", input: textAt(item, "code"), output: logs, error: failed})
+				case "image_generation_call":
+					out.push(HostedRun{tool: "image_generation", input: textAt(item, "revised_prompt"), output: "", error: failed})
+				case "mcp_call":
+					let error = item.get("error")
+					let problem = error is none ?? ("", error is string ?? (error, string(codec.encode(error))))
+					out.push(HostedRun{tool: "mcp", input: string(codec.encode(map<string, any>{"server": textAt(item, "server_label"), "name": textAt(item, "name"), "arguments": textAt(item, "arguments")})), output: textAt(item, "output"), error: problem})
+				case "mcp_list_tools":
+					out.push(HostedRun{tool: "mcp_list_tools", input: textAt(item, "server_label"), output: string(codec.encode(listAt(item, "tools"))), error: textAt(item, "error")})
+				default:
+			}
+		}
+		return out
+	}
+
+	// The images the image generation tool made during a reply of this
+	// library.
+	// Fails when one cannot be decoded.
+	def imagesOf(reply Message) !Image[] {
+		let out Image[]
+		let codec = new Base64()
+		for let (_, item) in itemsOf(reply) {
+			continue unless item is map<string, any> && textAt(item, "type") == "image_generation_call"
+			let data = textAt(item, "result")
+			continue when data.len() == 0
+			out.push(try image.load(try codec.decode(data)))
+		}
+		return out
+	}
+
+	// The tokens of a reply of this library with their log probabilities,
+	// when the client asked for them (`logprobs`); empty otherwise.
+	def logprobsOf(reply Message) TokenLogprob[] {
+		let out TokenLogprob[]
+		let kept = stateObjectOf(reply)
+		let listed = listAt(kept, "logprobs")
+		for let (_, item) in itemsOf(reply) {
+			continue unless item is map<string, any> && textAt(item, "type") == "message"
+			for let (_, part) in listAt(item, "content") {
+				listed.push(...listAt(part, "logprobs")) when part is map<string, any>
+			}
+		}
+		for let (_, entry) in listed {
+			continue unless entry is map<string, any>
+			let token = TokenLogprob{token: textAt(entry, "token"), logprob: floatAt(entry, "logprob")}
+			for let (_, alt) in listAt(entry, "top_logprobs") {
+				continue unless alt is map<string, any>
+				token.alternatives.push(textAt(alt, "token"))
+				token.likelihoods.push(floatAt(alt, "logprob"))
+			}
+			out.push(token)
+		}
+		return out
+	}
+
+	// The state a reply of this library kept: the Responses API's output
+	// items, or the token probabilities of Chat Completions. Older replies
+	// kept the reasoning items alone, as a list.
+	internal def stateObjectOf(m Message) map<string, any> {
+		for let (_, prefix) in string[responsesState, completionsState] {
+			continue unless m.providerState.startsWith(prefix)
+			let parsed = (new JSON()).parse(m.providerState.slice(prefix.len())) onerror recover none
+			return parsed when parsed is map<string, any>
+			return parsed is any[] ?? (map<string, any>{"items": parsed}, new map<string, any>())
+		}
+		return new map<string, any>()
+	}
+
+	internal def itemsOf(m Message) any[] {
+		return listAt(stateObjectOf(m), "items")
+	}
+
+	internal def floatAt(object map<string, any>, key string) float {
+		let v = object.get(key)
+		return v when v is float
+		return float(v) when v is int
+		return 0.0
+	}
+
+}

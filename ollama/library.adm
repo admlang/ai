@@ -1,5 +1,5 @@
 // Ollama API client
-@manifest(version = "0.1.0")
+@manifest(version = "0.1.1")
 library adm.ai.ollama {
 	use (
 		adm.ai.ollama

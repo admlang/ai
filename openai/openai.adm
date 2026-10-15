@@ -96,6 +96,20 @@ partial module adm.ai.openai {
 		serviceTier       ?ServiceTier    = none
 		// Lets the model ask for several calls in one reply.
 		parallelToolCalls bool            = true
+		// Tools OpenAI runs during a reply (Responses API): web search,
+		// search over vector stores, a Python sandbox, remote MCP servers,
+		// image generation. What they did is `hostedRunsOf(reply)`, what the
+		// reply cites `citationsOf(reply)`, the images `imagesOf(reply)`;
+		// sandbox code and its output stream as text.
+		webSearch         ?WebSearch       = none
+		fileSearch        ?FileSearch      = none
+		codeInterpreter   ?CodeInterpreter = none
+		mcpServers        McpServer[]      = []
+		imageGeneration   ?ImageGeneration = none
+		// Asks for each token's log probability and, when above 0, the
+		// likeliest alternatives (up to 20): `logprobsOf(reply)`.
+		logprobs          bool             = false
+		topLogprobs       int              = 0
 		// A stable id of the end user, for OpenAI's abuse detection.
 		safetyIdentifier  string          = ""
 		// Groups requests that share a long prefix, for the prompt cache.
@@ -129,6 +143,7 @@ partial module adm.ai.openai {
 		// Fails with RemoteError when the server refuses the request, or a
 		// message carries sound for the Responses API.
 		def reply(request ChatRequest) !ReplyStream {
+			fail RemoteError{message: "openai: hosted tools run in the Responses API; set `api` to Api.Responses", code: "badrequest", kind: RemoteErrorKind.BadRequest} when offersHosted(self) && !usesResponses()
 			if usesResponses() {
 				let res = try post(self, "/responses", try responsesBody(self, request))
 				return new ResponsesStream(res)
