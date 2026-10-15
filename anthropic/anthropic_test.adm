@@ -1,0 +1,356 @@
+partial module adm.ai.anthropic {
+	use (
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON)
+		std.formats.docs::(Document)
+		std.formats.audio::(Audio)
+		std.ai.llm
+		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, StopReason, ChatRequest, tool)
+	)
+
+	// An API key for the live test, which calls the real API with
+	// `ADM_TEST_ANTHROPIC_MODEL` (default claude-haiku-5-5).
+	@env("ADM_TEST_ANTHROPIC_KEY")
+	internal const liveKey string
+
+	@env("ADM_TEST_ANTHROPIC_MODEL")
+	internal const liveModel string
+
+
+	// What the live tests fill from a sentence.
+	internal struct LiveBooking {
+		guest  string
+		nights int
+	}
+
+	internal type ClaudeDesk {
+		// The weather of a city.
+		// @param city the city's name
+		@tool
+		def weather(city string) string {
+			return "{city}: 12 degrees and rain"
+		}
+
+		// The time in a city.
+		// @param city the city's name
+		@tool
+		def clock(city string) string {
+			return "{city}: 09:30"
+		}
+	}
+
+	internal type Seen {
+		bodies  map<string, any>[]
+		headers string[]
+		forms   string[]
+	}
+
+	internal def event(name string, data string) string {
+		return "event: {name}\ndata: {data}\n\n"
+	}
+
+	internal def claudeServer(seen Seen) !httptest.Server {
+		let mux = new http.ServeMux()
+		let codec = new JSON()
+		let keep = def (ctx http.Context) !map<string, any> {
+			seen.headers.push("{ctx.header("x-api-key")}|{ctx.header("anthropic-version")}|{ctx.header("anthropic-beta")}")
+			let body = new map<string, any>()
+			if ctx.header("Content-Type").startsWith("application/json") {
+				let parsed = try codec.parse(try ctx.text())
+				body = parsed when parsed is map<string, any>
+			} else {
+				seen.forms.push(string(try ctx.bytes()))
+			}
+			seen.bodies.push(body)
+			return body
+		}
+		try mux.handle("POST /v1/messages", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			let model = "{body.get("model")}"
+			return ctx.text(529, "\{\"type\":\"error\",\"error\":\{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}") when model == "busy"
+			return ctx.text(event("message_start", "\{\"type\":\"message_start\",\"message\":\{\"usage\":\{\"input_tokens\":3}}}") + event("error", "\{\"type\":\"error\",\"error\":\{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}")) when model == "breaks"
+			let messages = body.get("messages")
+			let answered = false
+			if messages is any[] {
+				let last = messages[messages.len() - 1]
+				let content = last is map<string, any> ?? (last.get("content"), none)
+				if content is any[] && content.len() > 0 {
+					let first = content[0]
+					answered = first is map<string, any> && "{first.get("type")}" == "tool_result"
+				}
+			}
+			let out = event("message_start", "\{\"type\":\"message_start\",\"message\":\{\"id\":\"msg_1\",\"usage\":\{\"input_tokens\":5,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":0,\"output_tokens\":1}}}")
+			if answered {
+				out += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":\{\"type\":\"text\",\"text\":\"\"}}")
+				out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"text_delta\",\"text\":\"Take a coat\"}}")
+				out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"text_delta\",\"text\":\" at 09:30.\"}}")
+				out += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":0}")
+				out += event("message_delta", "\{\"type\":\"message_delta\",\"delta\":\{\"stop_reason\":\"end_turn\"},\"usage\":\{\"output_tokens\":6}}")
+				return ctx.text(out + event("message_stop", "\{\"type\":\"message_stop\"}"))
+			}
+			out += event("ping", "\{\"type\":\"ping\"}")
+			out += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":\{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}")
+			out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"thinking_delta\",\"thinking\":\"Two tools.\"}}")
+			out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\{\"type\":\"signature_delta\",\"signature\":\"SIG\"}}")
+			out += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":0}")
+			out += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":1,\"content_block\":\{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":\{}}}")
+			out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":1,\"delta\":\{\"type\":\"input_json_delta\",\"partial_json\":\"\{\\\"city\\\": \\\"Os\"}}")
+			out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":1,\"delta\":\{\"type\":\"input_json_delta\",\"partial_json\":\"lo\\\"}\"}}")
+			out += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":1}")
+			out += event("content_block_start", "\{\"type\":\"content_block_start\",\"index\":2,\"content_block\":\{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"clock\",\"input\":\{}}}")
+			out += event("content_block_delta", "\{\"type\":\"content_block_delta\",\"index\":2,\"delta\":\{\"type\":\"input_json_delta\",\"partial_json\":\"\{\\\"city\\\":\\\"Oslo\\\"}\"}}")
+			out += event("content_block_stop", "\{\"type\":\"content_block_stop\",\"index\":2}")
+			out += event("message_delta", "\{\"type\":\"message_delta\",\"delta\":\{\"stop_reason\":\"tool_use\"},\"usage\":\{\"output_tokens\":40}}")
+			return ctx.text(out + event("message_stop", "\{\"type\":\"message_stop\"}"))
+		})
+		try mux.handle("POST /v1/messages/count_tokens", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"input_tokens\":42}")
+		})
+		try mux.handle("GET /v1/models", def (ctx http.Context) !none {
+			return ctx.text("\{\"data\":[\{\"id\":\"m3\",\"display_name\":\"Model 3\",\"created_at\":\"2026-01-02T03:04:05Z\",\"max_input_tokens\":1000000,\"max_tokens\":128000}],\"has_more\":false,\"last_id\":\"m3\"}") when ctx.request.query("after_id", "") == "m2"
+			return ctx.text("\{\"data\":[\{\"id\":\"m1\"},\{\"id\":\"m2\"}],\"has_more\":true,\"last_id\":\"m2\"}")
+		})
+		try mux.handle("GET /v1/models/\{id}", def (ctx http.Context) !none {
+			return ctx.text("\{\"id\":\"claude-opus-5-5\",\"display_name\":\"Claude Opus 5.5\",\"max_input_tokens\":1000000}")
+		})
+		try mux.handle("GET /v1/files", def (ctx http.Context) !none {
+			return ctx.text("\{\"data\":[\{\"id\":\"file_1\",\"filename\":\"notes.txt\"}],\"has_more\":false,\"last_id\":\"file_1\"}")
+		})
+		try mux.handle("DELETE /v1/files/\{id}", def (ctx http.Context) !none {
+			return ctx.text("\{\"id\":\"{ctx.request.param("id")}\",\"type\":\"file_deleted\"}")
+		})
+		try mux.handle("GET /v1/messages/batches", def (ctx http.Context) !none {
+			return ctx.text("\{\"data\":[\{\"id\":\"msgbatch_1\",\"processing_status\":\"ended\",\"request_counts\":\{\"succeeded\":1,\"errored\":1}}],\"has_more\":false}")
+		})
+		try mux.handle("POST /v1/messages/batches/\{id}/cancel", def (ctx http.Context) !none {
+			return ctx.text("\{\"id\":\"{ctx.request.param("id")}\",\"processing_status\":\"canceling\"}")
+		})
+		try mux.handle("DELETE /v1/messages/batches/\{id}", def (ctx http.Context) !none {
+			return ctx.text(400, "\{\"type\":\"error\",\"error\":\{\"type\":\"invalid_request_error\",\"message\":\"Batch has not ended\"}}") when ctx.request.param("id") == "running"
+			return ctx.text("\{\"id\":\"{ctx.request.param("id")}\",\"type\":\"message_batch_deleted\"}")
+		})
+		try mux.handle("POST /v1/files", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"file_1\",\"filename\":\"notes.txt\",\"mime_type\":\"text/plain\",\"size_bytes\":5,\"created_at\":\"2026-01-02T03:04:05Z\",\"downloadable\":false}")
+		})
+		try mux.handle("POST /v1/messages/batches", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"msgbatch_1\",\"processing_status\":\"in_progress\",\"request_counts\":\{\"processing\":2}}")
+		})
+		try mux.handle("GET /v1/messages/batches/\{id}/results", def (ctx http.Context) !none {
+			let ok = "\{\"custom_id\":\"a\",\"result\":\{\"type\":\"succeeded\",\"message\":\{\"content\":[\{\"type\":\"text\",\"text\":\"Hello\"},\{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"weather\",\"input\":\{\"city\":\"Rome\"}}],\"stop_reason\":\"tool_use\",\"usage\":\{\"input_tokens\":7,\"output_tokens\":3}}}}"
+			let bad = "\{\"custom_id\":\"b\",\"result\":\{\"type\":\"errored\",\"error\":\{\"type\":\"error\",\"error\":\{\"type\":\"invalid_request_error\",\"message\":\"max_tokens: too large\"}}}}"
+			return ctx.text("{ok}\n{bad}\n")
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		return server
+	}
+
+	internal def caught(run def () !none) RemoteError {
+		let out = RemoteError{message: "no failure", kind: RemoteErrorKind.Protocol}
+		run() onerror (err error) {
+			out = err when err is RemoteError
+			recover none
+		}
+		return out
+	}
+
+	check "Anthropic" {
+		@test()
+		def TestConversationWithThinkingAndTools() !none {
+			let seen = new Seen()
+			let server = try claudeServer(seen)
+			let ai = new Client(model = "claude-opus-5-5", apiKey = "sk-ant-test", baseURL = "http://{server.address().str()}/v1")
+			let chat = ai.chat()
+			chat.system = "Be brief."
+			chat.thinking = true
+			chat.reasoning = llm.Reasoning.High
+			chat.useTool(new ClaudeDesk())
+			let doc = new Document()
+			doc.title = "Forecast"
+			let reply = try chat.say("Coat in Oslo?", documents = [doc])
+			assert reply == "Take a coat at 09:30."
+			let all = chat.messages()
+			assert all.len() == 6 && all[2].thinking == "Two tools." && all[2].calls.len() == 2 && all[2].calls[0].arguments == "\{\"city\": \"Oslo\"}"
+			let used = chat.usage()
+			assert used.inputTokens == 210 && used.cacheWriteTokens == 200 && used.outputTokens == 46
+
+			let first = seen.bodies[0]
+			assert "{first["system"]}" == "Be brief." && "{first["max_tokens"]}" == "4096" && "{first["fallbacks"]}" == "default"
+			let thinking = first["thinking"]
+			let output = first["output_config"]
+			let cache = first["cache_control"]
+			fail "settings missing" unless thinking is map<string, any> && output is map<string, any> && cache is map<string, any>
+			assert "{thinking["type"]}" == "adaptive" && "{thinking["display"]}" == "summarized" && "{output["effort"]}" == "high" && "{cache["type"]}" == "ephemeral"
+			let tools = first["tools"]
+			fail "no tools" unless tools is any[] && tools.len() == 2
+			let weather = tools[0]
+			fail "no tool" unless weather is map<string, any>
+			assert "{weather["eager_input_streaming"]}" == "true"
+			assert seen.headers[0] == "sk-ant-test|2023-06-01|server-side-fallback-2026-07-01"
+			let firstMessages = first["messages"]
+			fail "no messages" unless firstMessages is any[]
+			let asked = firstMessages[0]
+			fail "no user message" unless asked is map<string, any>
+			let parts = asked["content"]
+			fail "no parts" unless parts is any[] && parts.len() == 2
+			let block = parts[0]
+			fail "no document" unless block is map<string, any>
+			assert "{block["type"]}" == "document" && "{block["title"]}" == "Forecast"
+
+			// The second request: the reply's blocks unchanged (signed
+			// thinking first), then both results in one user message.
+			let messages = seen.bodies[1]["messages"]
+			fail "no messages" unless messages is any[]
+			assert messages.len() == 3
+			let assistant = messages[1]
+			let results = messages[2]
+			fail "not objects" unless assistant is map<string, any> && results is map<string, any>
+			let content = assistant["content"]
+			fail "no content" unless content is any[] && content.len() == 3
+			let signed = content[0]
+			fail "no thinking block" unless signed is map<string, any>
+			assert "{signed["type"]}" == "thinking" && "{signed["signature"]}" == "SIG" && "{signed["thinking"]}" == "Two tools."
+			let call = content[1]
+			fail "no call block" unless call is map<string, any>
+			let input = call["input"]
+			fail "no input" unless input is map<string, any>
+			assert "{input["city"]}" == "Oslo"
+			let answers = results["content"]
+			fail "no results" unless answers is any[]
+			assert answers.len() == 2 && "{results["role"]}" == "user"
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestErrorsAndSettings() !none {
+			let seen = new Seen()
+			let server = try claudeServer(seen)
+			let ai = new Client(apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			ai.httpClient.retry.attempts = 0
+			let busy = caught(def () !none {
+				try ai.chat("busy").say("hi")
+				return none
+			})
+			assert busy.kind == RemoteErrorKind.Overloaded && busy.status == 529 && busy.remoteCode == "overloaded_error"
+			let broke = caught(def () !none {
+				try ai.chat("breaks").say("hi")
+				return none
+			})
+			assert broke.kind == RemoteErrorKind.Overloaded
+			let sound = caught(def () !none {
+				try ai.chat("m").ask("hi", audio = [new Audio()])
+				return none
+			})
+			assert sound.kind == RemoteErrorKind.BadRequest
+
+			// Older models: a thinking budget; no caching; no fallback.
+			ai.thinkingBudget = 2048
+			ai.caching = Caching.Off
+			let chat = ai.chat("claude-haiku-4-5")
+			chat.thinking = true
+			chat.stopAt = ["END"]
+			chat.topK = 5
+			chat.schema = map<string, any>{"type": "object"}
+			try chat.say("Coat in Oslo?")
+			let body = seen.bodies[seen.bodies.len() - 2]
+			let thinking = body["thinking"]
+			fail "no thinking" unless thinking is map<string, any>
+			assert "{thinking["type"]}" == "enabled" && "{thinking["budget_tokens"]}" == "2048"
+			assert body.get("cache_control") is none && body.get("fallbacks") is none && "{body["top_k"]}" == "5"
+			let output = body["output_config"]
+			fail "no output_config" unless output is map<string, any>
+			let format = output["format"]
+			fail "no format" unless format is map<string, any>
+			assert "{format["type"]}" == "json_schema"
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestEndpoints() !none {
+			let seen = new Seen()
+			let server = try claudeServer(seen)
+			let ai = new Client(model = "claude-opus-5-5", apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			let chat = ai.chat()
+			chat.system = "Be brief."
+			try chat.add(Message{role: Role.User, text: "Hello"})
+			assert (try ai.countTokens(chat, next = "And?")) == 42
+			let counted = seen.bodies[0]
+			assert counted.get("max_tokens") is none && counted.get("fallbacks") is none
+			let messages = counted["messages"]
+			fail "no messages" unless messages is any[]
+			assert messages.len() == 2
+
+			let opus = try ai.modelInfo("claude-opus-5-5")
+			assert opus.name == "Claude Opus 5.5" && opus.contextWindow == 1000000
+			// An uploaded file named in a message.
+			let reading = ai.chat()
+			try reading.ask(Message{text: "Summarise it.", files: [llm.RemoteFile{id: "file_7", mediaType: "application/pdf"}, llm.RemoteFile{id: "file_8", mediaType: "image/png"}]})
+			reading.reset()
+			let asked = seen.bodies[seen.bodies.len() - 1]["messages"]
+			fail "no messages" unless asked is any[]
+			let content = (new JSON()).encode(asked)
+			assert string(content).contains("\"type\":\"document\",\"source\":\{\"type\":\"file\",\"file_id\":\"file_7\"}") && string(content).contains("\"type\":\"image\",\"source\":\{\"type\":\"file\",\"file_id\":\"file_8\"}")
+
+			let models = try ai.models()
+			assert models.len() == 3 && models[2].contextWindow == 1000000 && models[2].name == "Model 3" && !(models[2].created is none)
+
+			let file = try ai.files.upload("notes".bytes(), "notes.txt", "text/plain")
+			assert file.id == "file_1" && file.size == 5 && !file.downloadable
+			assert seen.forms[0].contains("filename=\"notes.txt\"") && seen.forms[0].contains("notes")
+			assert (try ai.files.list())[0].id == "file_1"
+			try ai.files.delete("file_1")
+
+			let batch = try ai.batches.create([BatchRequest{id: "a", request: ChatRequest{model: "claude-haiku-5-5", messages: [Message{role: Role.User, text: "Hi"}], limit: 100}}])
+			assert batch.id == "msgbatch_1" && batch.requests.processing == 2
+			let sent = seen.bodies[seen.bodies.len() - 1]["requests"]
+			fail "no requests" unless sent is any[]
+			let one = sent[0]
+			fail "no request" unless one is map<string, any>
+			assert "{one["custom_id"]}" == "a"
+			let listed = try ai.batches.list()
+			assert listed.len() == 1 && listed[0].status == "ended" && listed[0].requests.errored == 1
+			assert (try ai.batches.cancel("msgbatch_1")).status == "canceling"
+			try ai.batches.delete("msgbatch_1")
+			let refused = caught(def () !none {
+				try ai.batches.delete("running")
+				return none
+			})
+			assert refused.kind == RemoteErrorKind.BadRequest && refused.remoteCode == "invalid_request_error"
+			let results = try ai.batches.results("msgbatch_1")
+			assert results.len() == 2 && results[0].outcome == BatchOutcome.Succeeded && results[0].message.text == "Hello" && results[0].message.calls[0].name == "weather" && results[0].stop == StopReason.Calls
+			assert results[1].outcome == BatchOutcome.Errored && results[1].error == "max_tokens: too large"
+			try server.close()
+			return none
+		}
+
+		// With ADM_TEST_ANTHROPIC_KEY: a short answer, a tool round and a
+		// token count from the real API.
+		@test()
+		def TestLiveApi() !none {
+			return none when liveKey.len() == 0
+			let ai = new Client(model = liveModel.len() > 0 ?? (liveModel, "claude-haiku-5-5"), apiKey = liveKey)
+			let chat = ai.chat()
+			chat.limit = 1000
+			let answer = try chat.say("What is 2 + 3? Reply with the number only.")
+			assert answer.contains("5") && chat.usage().outputTokens > 0
+			let tools = ai.chat()
+			tools.limit = 2000
+			tools.useTool(new ClaudeDesk())
+			try tools.say("What is the weather in Oslo? Use the tool.")
+			let all = tools.messages()
+			assert all.len() >= 4 && all[1].calls.len() >= 1 && all[2].role == Role.Tool
+			let booking = LiveBooking{}
+			try ai.chat().fill(booking, "Extract the guest's name and the number of nights from this text: Ada Lovelace stays three nights.")
+			fail "filled {booking.guest} {booking.nights}" unless booking.guest.contains("Ada") && booking.nights == 3
+			assert (try ai.countTokens(tools)) > 0
+			return none
+		}
+	}
+}

@@ -1,0 +1,210 @@
+partial module adm.ai.openai {
+	use (
+		std.bytes
+		std.net.http
+		std.data.encoding::(JSON, Base64)
+		std.formats.audio
+		std.formats.audio::(Audio, PCM)
+		std.ai.llm::(ChatRequest, ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, Message, Role, ToolCall, schemaOf, withDocuments)
+	)
+
+	// The body of /chat/completions for `request`.
+	internal def completionsBody(client Client, request ChatRequest) !map<string, any> {
+		let messages any[] = []
+		messages.push(map<string, any>{"role": "system", "content": request.system}) when request.system.len() > 0
+		for let (_, m) in request.messages {
+			messages.push(try completionMessage(m))
+		}
+		let body = map<string, any>{"model": request.model, "messages": messages, "stream": true, "stream_options": map<string, any>{"include_usage": true}}
+		body.set(client.baseURL == openaiURL ?? ("max_completion_tokens", "max_tokens"), request.limit) when request.limit > 0
+		body.set("temperature", request.temperature) unless request.temperature is none
+		body.set("top_p", request.topP) unless request.topP is none
+		body.set("top_k", request.topK) unless request.topK is none
+		body.set("seed", int(request.seed)) unless request.seed is none
+		if request.stopAt.len() > 0 {
+			let stops any[] = []
+			for let (_, s) in request.stopAt {
+				stops.push(s)
+			}
+			body.set("stop", stops)
+		}
+		if request.tools.len() > 0 {
+			let tools any[] = []
+			for let (_, t) in request.tools {
+				tools.push(map<string, any>{"type": "function", "function": map<string, any>{"name": t.name, "description": t.description, "parameters": schemaOf(t)}})
+			}
+			body.set("tools", tools)
+			body.set("parallel_tool_calls", client.parallelToolCalls)
+		}
+		let effort = effortOf(client, request)
+		body.set("reasoning_effort", effort) unless effort is none
+		let verbosity = client.verbosity
+		body.set("verbosity", verbosity.value) unless verbosity is none
+		let schema = request.schema
+		body.set("response_format", map<string, any>{"type": "json_schema", "json_schema": map<string, any>{"name": "reply", "schema": schema, "strict": false}}) unless schema is none
+		let tier = client.serviceTier
+		body.set("service_tier", tier.value) unless tier is none
+		body.set("safety_identifier", client.safetyIdentifier) when client.safetyIdentifier.len() > 0
+		body.set("prompt_cache_key", client.promptCacheKey) when client.promptCacheKey.len() > 0
+		return body
+	}
+
+	// One message of /chat/completions: text alone as a string, with
+	// pictures or sound as parts.
+	internal def completionMessage(m Message) !map<string, any> {
+		let shown = withDocuments(m)
+		match m.role {
+			case Role.System:
+				return map<string, any>{"role": "system", "content": shown.text}
+			case Role.Tool:
+				return map<string, any>{"role": "tool", "tool_call_id": m.callId, "content": shown.text}
+			case Role.Assistant:
+				let out = map<string, any>{"role": "assistant", "content": shown.text}
+				if m.calls.len() > 0 {
+					let calls any[] = []
+					for let (_, c) in m.calls {
+						calls.push(map<string, any>{"id": c.id, "type": "function", "function": map<string, any>{"name": c.name, "arguments": c.arguments.len() > 0 ?? (c.arguments, "\{}")}})
+					}
+					out.set("tool_calls", calls)
+				}
+				return out
+			default:
+		}
+		return map<string, any>{"role": "user", "content": shown.text} when m.images.len() == 0 && m.audio.len() == 0 && m.files.len() == 0
+		let parts any[] = []
+		parts.push(map<string, any>{"type": "text", "text": shown.text}) when shown.text.len() > 0
+		for let (_, picture) in m.images {
+			parts.push(map<string, any>{"type": "image_url", "image_url": map<string, any>{"url": try imageURL(picture)}})
+		}
+		for let (_, file) in m.files {
+			parts.push(map<string, any>{"type": "file", "file": map<string, any>{"file_id": file.id}})
+		}
+		for let (_, sound) in m.audio {
+			parts.push(map<string, any>{"type": "input_audio", "input_audio": map<string, any>{"data": (new Base64()).encode(try wavOf(sound)), "format": "wav"}})
+		}
+		return map<string, any>{"role": "user", "content": parts}
+	}
+
+	// A sound as WAV bytes.
+	internal def wavOf(sound Audio) !byte[] {
+		let pcm = new PCM()
+		pcm.info = sound.info
+		pcm.samples = sound.samples
+		let buffer = new bytes.Buffer()
+		try audio.write(pcm.stream(), buffer, ".wav")
+		return buffer.bytes()
+	}
+
+	// A call being assembled from its pieces, by its index in the reply.
+	internal struct PartialCall {
+		id        string
+		name      string
+		arguments string
+	}
+
+	// The reply of /chat/completions as it streams (server-sent events, the
+	// last `[DONE]`). Calls arrive in pieces and are reported whole when the
+	// choice finishes. Implements `llm.ReplyStream`.
+	internal type CompletionsStream {
+		internal res      http.Response
+		internal events   http.EventReader
+		internal pending  ReplyEvent[]
+		internal ended    bool
+		internal calls    PartialCall[]
+		internal finished string
+		internal used     Usage
+
+		def new(res http.Response) {
+			self.res = res
+			events = new http.EventReader(res.body)
+		}
+
+		// The next event; none after `Done`.
+		// Fails with RemoteError when the connection breaks or the server
+		// reports an error mid-reply.
+		def next() !?ReplyEvent {
+			for pending.len() == 0 {
+				return none when ended
+				let event = events.next() onerror (err error) {
+					close()
+					fail RemoteError{message: "openai: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+				}
+				if event is none || event.data.trim() == "[DONE]" {
+					// A server that closes the stream once the choice
+					// finished without [DONE] ends it as well.
+					if event is none && finished.len() == 0 {
+						close()
+						fail RemoteError{message: "openai: the reply ended before it was done", code: "protocol", kind: RemoteErrorKind.Protocol}
+					}
+					conclude()
+					continue
+				}
+				try take(event.data)
+			}
+			let event = pending[0]
+			pending.remove(0)
+			return event
+		}
+
+		// Stops reading the reply.
+		def close() {
+			ended = true
+			res.close() onerror recover none
+		}
+
+		internal def take(data string) !none {
+			let parsed = (new JSON()).parse(data) onerror (err error) {
+				close()
+				fail RemoteError{message: "openai: an event is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+			}
+			return none unless parsed is map<string, any>
+			let error = objectAt(parsed, "error")
+			if error.len() > 0 {
+				close()
+				fail failedError(textAt(error, "code"), textAt(error, "message"))
+			}
+			let usage = objectAt(parsed, "usage")
+			used = completionsUsage(usage) when usage.len() > 0
+			for let (_, choice) in listAt(parsed, "choices") {
+				continue unless choice is map<string, any>
+				let delta = objectAt(choice, "delta")
+				let reasoning = textAt(delta, "reasoning_content") + textAt(delta, "reasoning")
+				pending.push(ReplyEvent{kind: ReplyEventKind.Thinking, text: reasoning}) when reasoning.len() > 0
+				let text = textAt(delta, "content") + textAt(delta, "refusal")
+				pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: text}) when text.len() > 0
+				finished = "refusal" when textAt(delta, "refusal").len() > 0
+				for let (_, piece) in listAt(delta, "tool_calls") {
+					continue unless piece is map<string, any>
+					let at = intAt(piece, "index")
+					for calls.len() <= at {
+						calls.push(PartialCall{})
+					}
+					let function = objectAt(piece, "function")
+					let id = textAt(piece, "id")
+					calls[at].id = id when id.len() > 0
+					calls[at].name += textAt(function, "name")
+					calls[at].arguments += textAt(function, "arguments")
+				}
+				let reason = textAt(choice, "finish_reason")
+				finished = reason when reason.len() > 0 && finished != "refusal"
+			}
+			return none
+		}
+
+		// The calls, then the end, once the stream is done.
+		internal def conclude() {
+			for let (k, c) in calls {
+				pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(c.id.len() > 0 ?? (c.id, "call_{k + 1}"), c.name, c.arguments)})
+			}
+			let stop = finished == "length" ?? (StopReason.Limit, finished == "content_filter" || finished == "refusal" ?? (StopReason.Filtered, calls.len() > 0 ?? (StopReason.Calls, StopReason.End)))
+			pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: used})
+			close()
+		}
+	}
+
+	internal def completionsUsage(usage map<string, any>) Usage {
+		let prompt = objectAt(usage, "prompt_tokens_details")
+		let completion = objectAt(usage, "completion_tokens_details")
+		return Usage{inputTokens: intAt(usage, "prompt_tokens"), outputTokens: intAt(usage, "completion_tokens"), cachedTokens: intAt(prompt, "cached_tokens"), thinkingTokens: intAt(completion, "reasoning_tokens")}
+	}
+}

@@ -1,0 +1,176 @@
+partial module adm.ai.gemini {
+	use (
+		std.net.http
+		std.data.encoding::(JSON)
+		std.ai.llm::(ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, ToolCall, Message)
+	)
+
+	// A web page a grounded reply drew on.
+	struct Source {
+		uri   string
+		title string
+	}
+
+	// A stretch of a grounded reply's text and the sources it rests on.
+	struct Support {
+		text    string
+		// Byte offsets of the stretch in the reply's text.
+		start   int
+		end     int
+		// Indexes into `Grounding.sources`.
+		sources int[]
+	}
+
+	// What a reply grounded in Google Search or web pages rests on.
+	struct Grounding {
+		// The searches the model ran.
+		queries  string[]
+		sources  Source[]
+		supports Support[]
+	}
+
+	// The grounding of a reply of this library (`googleSearch`,
+	// `urlContext`); empty for any other message.
+	def groundingOf(reply Message) Grounding {
+		let out = Grounding{}
+		let grounding = objectAt(stateOf(reply), "grounding")
+		for let (_, q) in listAt(grounding, "webSearchQueries") {
+			out.queries.push(q) when q is string
+		}
+		for let (_, chunk) in listAt(grounding, "groundingChunks") {
+			continue unless chunk is map<string, any>
+			let web = objectAt(chunk, "web")
+			let page = web.len() > 0 ?? (web, objectAt(chunk, "retrievedContext"))
+			out.sources.push(Source{uri: textAt(page, "uri"), title: textAt(page, "title")})
+		}
+		for let (_, item) in listAt(grounding, "groundingSupports") {
+			continue unless item is map<string, any>
+			let segment = objectAt(item, "segment")
+			let support = Support{text: textAt(segment, "text"), start: intAt(segment, "startIndex"), end: intAt(segment, "endIndex")}
+			for let (_, index) in listAt(item, "groundingChunkIndices") {
+				support.sources.push(index) when index is int
+			}
+			out.supports.push(support)
+		}
+		return out
+	}
+
+	// The reply of streamGenerateContent as it streams (server-sent events,
+	// a chunk of parts each). Every part is kept as sent, thought
+	// signatures among them, for the reply's `Message.providerState`.
+	// Implements `llm.ReplyStream`.
+	internal type ContentStream {
+		internal res       http.Response
+		internal events    http.EventReader
+		internal pending   ReplyEvent[]
+		internal ended     bool
+		internal parts     any[]
+		internal grounding any
+		internal calls     int
+		internal reason    string
+		internal blocked   bool
+		internal used      Usage
+
+		def new(res http.Response) {
+			self.res = res
+			events = new http.EventReader(res.body)
+		}
+
+		// The next event; none after `Done`.
+		// Fails with RemoteError when the connection breaks, the API reports
+		// an error mid-reply, or the stream ends before the reply finished.
+		def next() !?ReplyEvent {
+			for pending.len() == 0 {
+				return none when ended
+				let event = events.next() onerror (err error) {
+					close()
+					fail RemoteError{message: "gemini: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+				}
+				if event is none {
+					if reason.len() == 0 && !blocked {
+						close()
+						fail RemoteError{message: "gemini: the reply ended before it finished", code: "protocol", kind: RemoteErrorKind.Protocol}
+					}
+					conclude()
+					continue
+				}
+				try take(event.data)
+			}
+			let event = pending[0]
+			pending.remove(0)
+			return event
+		}
+
+		// Stops reading the reply.
+		def close() {
+			ended = true
+			res.close() onerror recover none
+		}
+
+		internal def take(data string) !none {
+			let parsed = (new JSON()).parse(data) onerror (err error) {
+				close()
+				fail RemoteError{message: "gemini: an event is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+			}
+			return none unless parsed is map<string, any>
+			let error = objectAt(parsed, "error")
+			if error.len() > 0 {
+				close()
+				let status = textAt(error, "status")
+				fail RemoteError{message: "gemini: {textAt(error, "message")}", code: kindOf(status, intAt(error, "code")).value, kind: kindOf(status, intAt(error, "code")), remoteCode: status}
+			}
+			blocked = blocked || textAt(objectAt(parsed, "promptFeedback"), "blockReason").len() > 0
+			let usage = objectAt(parsed, "usageMetadata")
+			if usage.len() > 0 {
+				let thoughts = intAt(usage, "thoughtsTokenCount")
+				used = Usage{inputTokens: intAt(usage, "promptTokenCount"), outputTokens: intAt(usage, "candidatesTokenCount") + thoughts, cachedTokens: intAt(usage, "cachedContentTokenCount"), thinkingTokens: thoughts}
+			}
+			let candidates = listAt(parsed, "candidates")
+			return none when candidates.len() == 0
+			let candidate = candidates[0]
+			return none unless candidate is map<string, any>
+			for let (_, part) in listAt(objectAt(candidate, "content"), "parts") {
+				continue unless part is map<string, any>
+				parts.push(part)
+				let thought = part.get("thought")
+				let text = textAt(part, "text")
+				pending.push(ReplyEvent{kind: thought is bool && thought ?? (ReplyEventKind.Thinking, ReplyEventKind.Text), text: text}) when text.len() > 0
+				let call = objectAt(part, "functionCall")
+				if call.len() > 0 {
+					calls++
+					let id = textAt(call, "id")
+					let args = call.get("args")
+					let arguments = args is none ?? ("\{}", string((new JSON()).encode(args)))
+					pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(id.len() > 0 ?? (id, "call_made_{calls}"), textAt(call, "name"), arguments)})
+				}
+				let code = objectAt(part, "executableCode")
+				pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "\n```{textAt(code, "language").lower()}\n{textAt(code, "code")}\n```\n"}) when code.len() > 0
+				let result = objectAt(part, "codeExecutionResult")
+				pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: "\n```\n{textAt(result, "output")}\n```\n"}) when result.len() > 0
+			}
+			let ground = candidate.get("groundingMetadata")
+			grounding = ground unless ground is none
+			let finishing = textAt(candidate, "finishReason")
+			reason = finishing when finishing.len() > 0
+			return none
+		}
+
+		// The end, once the stream is done.
+		internal def conclude() {
+			let state = map<string, any>{"parts": parts}
+			state.set("grounding", grounding) unless grounding is none
+			let stop = StopReason.End
+			match reason {
+				case "MAX_TOKENS":
+					stop = StopReason.Limit
+				case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "LANGUAGE":
+					stop = StopReason.Filtered
+				default:
+					stop = calls > 0 ?? (StopReason.Calls, StopReason.End)
+			}
+			stop = StopReason.Filtered when blocked
+			pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: used, state: partsState + string((new JSON()).encode(state))})
+			close()
+		}
+	}
+}

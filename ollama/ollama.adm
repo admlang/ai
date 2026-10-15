@@ -1,3 +1,308 @@
+// An Ollama client: the native API of a local or remote Ollama server,
+// over std.net.http. Its conversations are std.ai.llm's: `chat()` gives a
+// `llm.RemoteChat`, with tools, `@tool` methods, MCP tools, pictures and
+// documents as a local `llm.Session` takes them; `embedder` gives a
+// `std.ai.embeddings.Embedder`.
+//
+// ```
+// let ai = new ollama.Client(model = "qwen3:4b")
+// let chat = ai.chat()
+// print(try chat.say("Hello"))
+// chat.model = "qwen3:30b"
+// print(try chat.say("And now?"))
+// ```
 partial module adm.ai.ollama {
-	// Ollama native API over std.net.http: chat and generate with streaming, embeddings, model management (pull, list, show, create, delete), keep-alive
+	use (
+		std.time
+		std.bytes
+		std.services.runtime::(Runtime)
+		std.net.http
+		std.data.encoding::(JSON, Base64)
+		std.formats.image::(Image)
+		std.ai.llm
+		std.ai.llm::(RemoteChat, ChatRequest, ReplyStream, RemoteError, RemoteErrorKind, Message, Role, Tool, Reasoning, schemaOf, withDocuments, remoteErrorKind)
+		adm.ai.ollama.wire::*
+	)
+
+	// The server `new Client()` talks to when OLLAMA_HOST is not set.
+	const defaultHost = "http://127.0.0.1:11434"
+
+	// A connection to one Ollama server: the model new conversations and
+	// `generate` use, and settings every request carries. It holds no
+	// connection of its own (std.net.http keeps them), so any number of
+	// tasks may share it.
+	//
+	// Requests fail with `llm.RemoteError`: NotFound for a model the server
+	// does not have, BadRequest for a request it refuses, Transport when it
+	// cannot be reached, Server for its own failures.
+	partial type Client {
+		// The model `chat()` and `generate` use ("qwen3:4b"); a conversation
+		// keeps its own copy, which can change between replies.
+		model         string
+		// The server's address: `http://host:port`.
+		host          string
+		// How long the server keeps a model loaded after a request: none for
+		// its default (5 minutes), 0s to unload it at once, a negative value
+		// to keep it loaded.
+		keepAlive     ?duration       = none
+		// Tokens of context the server gives the model (`num_ctx`); 0 for
+		// the model's default.
+		contextSize   int             = 0
+		// Drops tokens less likely than `minP` times the best one; none for
+		// the model's default.
+		minP          ?float          = none
+		// Makes repeated tokens less likely; none for the model's default.
+		repeatPenalty ?float          = none
+		// Sent as `Authorization: Bearer` to a server behind a proxy that
+		// asks for one.
+		token         ?Secret<string> = none
+		// The HTTP client requests go through: headers, timeouts, a
+		// transport. Busy and rate-limited replies are sent again (`retry`).
+		httpClient    http.Client
+
+		// A client of the server at `host` (`host:port` or a URL), else
+		// `OLLAMA_HOST`, else 127.0.0.1:11434.
+		def new(model string = "", host string = "") {
+			self.model = model
+			let env = Runtime.getEnv("OLLAMA_HOST")
+			let given = host.len() > 0 ?? (host, env is none ?? ("", env))
+			self.host = baseOf(given.len() > 0 ?? (given, defaultHost))
+			httpClient = new http.Client()
+			httpClient.retry = http.RetryPolicy{attempts: 3, statuses: [429, 502, 503, 504], allMethods: true}
+		}
+
+		// A conversation with `model` (none: the client's), as a local
+		// session holds one: `ask`, `next`, `say`, tools and their rounds,
+		// `answer`. It is a `llm.Chat`.
+		def chat(model string = "") RemoteChat {
+			return new RemoteChat(self, model.len() > 0 ?? (model, self.model))
+		}
+
+		// Sends `request` to /api/chat and returns the reply as it streams:
+		// what `RemoteChat` calls. Implements `llm.ChatProvider`.
+		// Fails with RemoteError when the server refuses the request, or a
+		// message carries sound (the API takes text and pictures).
+		def reply(request ChatRequest) !ReplyStream {
+			let body = try chatBody(request)
+			let res = try post(self, "/api/chat", body)
+			return new ChatStream(res)
+		}
+
+		// Continues `prompt` without chat markup (/api/generate): the
+		// model's own completion, `system` and `images` as the model's
+		// template places them, `suffix` the text that follows the gap for
+		// a model that fills in the middle. `limit` bounds the tokens; 0 for
+		// the server's default. Read the result with `next` as it streams,
+		// or `text` at once.
+		// Fails like `reply`.
+		def generate(prompt string, system string = "", images Image[] = Image[], suffix string = "", limit int = 0, model string = "") !Completion {
+			let body = map<string, any>{"model": model.len() > 0 ?? (model, self.model), "prompt": prompt, "stream": true}
+			body.set("system", system) when system.len() > 0
+			body.set("suffix", suffix) when suffix.len() > 0
+			body.set("images", try encodedImages(images)) when images.len() > 0
+			let options = optionsOf(none, none, none, none, string[], limit)
+			body.set("options", options) when options.len() > 0
+			body.set("keep_alive", keepAliveOf(keepAlive)) unless keepAlive is none
+			let res = try post(self, "/api/generate", body)
+			return new Completion(res)
+		}
+
+		// The vectors of an embedding model on the server; `dimensions`
+		// shortens them where the model allows (0 for its own size). It is
+		// a `std.ai.embeddings.Embedder`.
+		def embedder(model string, dimensions int = 0) Embeddings {
+			return new Embeddings(self, model, dimensions)
+		}
+
+		// The server's version ("0.12.3").
+		// Fails like `reply`.
+		def version() !string {
+			let res = try send(self, http.Method.GET, "/api/version", none)
+			let reply = new VersionWire()
+			try decodeBody(res, reply)
+			return reply.version
+		}
+
+		// The body of /api/chat for `request`.
+		internal def chatBody(request ChatRequest) !map<string, any> {
+			let messages any[] = []
+			messages.push(map<string, any>{"role": "system", "content": request.system}) when request.system.len() > 0
+			for let (_, m) in request.messages {
+				messages.push(try messageOf(m, request.messages))
+			}
+			let body = map<string, any>{"model": request.model, "messages": messages, "stream": true}
+			if request.tools.len() > 0 {
+				let tools any[] = []
+				for let (_, t) in request.tools {
+					tools.push(map<string, any>{"type": "function", "function": map<string, any>{"name": t.name, "description": t.description, "parameters": schemaOf(t)}})
+				}
+				body.set("tools", tools)
+			}
+			let think = thinkOf(request.thinking, request.reasoning)
+			body.set("think", think) unless think is none
+			let schema = request.schema
+			body.set("format", schema) unless schema is none
+			let options = optionsOf(request.temperature, request.topP, request.topK, request.seed, request.stopAt, request.limit)
+			body.set("options", options) when options.len() > 0
+			body.set("keep_alive", keepAliveOf(keepAlive)) unless keepAlive is none
+			return body
+		}
+
+		// The model options of a request: the request's settings and the
+		// client's.
+		internal def optionsOf(temperature ?float, topP ?float, topK ?int, seed ?uint, stopAt string[], limit int) map<string, any> {
+			let out = new map<string, any>()
+			out.set("temperature", temperature) unless temperature is none
+			out.set("top_p", topP) unless topP is none
+			out.set("top_k", topK) unless topK is none
+			out.set("seed", int(seed)) unless seed is none
+			if stopAt.len() > 0 {
+				let stops any[] = []
+				for let (_, s) in stopAt {
+					stops.push(s)
+				}
+				out.set("stop", stops)
+			}
+			out.set("num_predict", limit) when limit > 0
+			out.set("num_ctx", contextSize) when contextSize > 0
+			out.set("min_p", minP) unless minP is none
+			out.set("repeat_penalty", repeatPenalty) unless repeatPenalty is none
+			return out
+		}
+	}
+
+	// Posts `body` as JSON to `path` on the client's server and returns the
+	// reply, its status checked.
+	internal def post(client Client, path string, body map<string, any>) !http.Response {
+		return try send(client, http.Method.POST, path, body)
+	}
+
+	internal def send(client Client, method http.Method, path string, body ?map<string, any>) !http.Response {
+		let req = try client.httpClient.request(method, client.host + path)
+		if body is map<string, any> {
+			req.replaceBody((new JSON()).encode(body))
+			req.headers.set("Content-Type", "application/json")
+		}
+		let secret = client.token
+		req.bearerToken(secret.reveal()) unless secret is none
+		let res = client.httpClient.do(req) onerror (err error) {
+			fail RemoteError{message: "ollama: {client.host}: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+		}
+		try checked(res)
+		return res
+	}
+
+	// `host:port` or a URL as the base of request URLs, without a trailing
+	// slash.
+	internal def baseOf(given string) string {
+		let base = given.trim().trimEnd("/")
+		return base.startsWith("http://") || base.startsWith("https://") ?? (base, "http://" + base)
+	}
+
+	// Ollama's `keep_alive`: seconds, negative for ever.
+	internal def keepAliveOf(span ?duration) any {
+		return none when span is none
+		return int(span.seconds())
+	}
+
+	// Ollama's `think`: a level when a reasoning length is asked for, else
+	// on or off; none leaves the model's default.
+	internal def thinkOf(thinking ?bool, reasoning ?Reasoning) any {
+		return false when thinking is bool && !thinking
+		if reasoning is Reasoning {
+			match reasoning {
+				case Reasoning.Low:
+					return "low"
+				case Reasoning.Medium:
+					return "medium"
+				case Reasoning.High:
+					return "high"
+			}
+		}
+		return thinking
+	}
+
+	// One message of /api/chat. A tool's result names its tool, which
+	// Ollama reads instead of the call's id: found in the calls of the
+	// messages before it.
+	internal def messageOf(m Message, all Message[]) !map<string, any> {
+		fail RemoteError{message: "ollama: the chat API takes no sound; a message carries {m.audio.len()} recordings", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.audio.len() > 0
+		fail RemoteError{message: "ollama: the server has no uploaded files; give the content as text, images or documents", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.files.len() > 0
+		let shown = withDocuments(m)
+		let out = map<string, any>{"role": roleName(m.role), "content": shown.text}
+		out.set("thinking", m.thinking) when m.thinking.len() > 0 && m.role == Role.Assistant
+		out.set("images", try encodedImages(m.images)) when m.images.len() > 0
+		if m.calls.len() > 0 {
+			let calls any[] = []
+			for let (_, c) in m.calls {
+				let arguments = (new JSON()).parse(c.arguments.len() > 0 ?? (c.arguments, "\{}")) onerror recover new map<string, any>()
+				calls.push(map<string, any>{"id": c.id, "function": map<string, any>{"name": c.name, "arguments": arguments}})
+			}
+			out.set("tool_calls", calls)
+		}
+		if m.role == Role.Tool {
+			out.set("tool_call_id", m.callId)
+			let name = callName(all, m.callId)
+			out.set("tool_name", name) when name.len() > 0
+		}
+		return out
+	}
+
+	internal def roleName(role Role) string {
+		match role {
+			case Role.System:
+				return "system"
+			case Role.User:
+				return "user"
+			case Role.Assistant:
+				return "assistant"
+			case Role.Tool:
+				return "tool"
+		}
+		return "user"
+	}
+
+	// The name of the tool the call `id` asked for, "" when no message
+	// holds it.
+	internal def callName(all Message[], id string) string {
+		for let (_, m) in all {
+			for let (_, c) in m.calls {
+				return c.name when c.id == id
+			}
+		}
+		return ""
+	}
+
+	// Pictures as base64 PNG, as the API takes them.
+	internal def encodedImages(images Image[]) !any[] {
+		let out any[] = []
+		let codec = new Base64()
+		for let (_, picture) in images {
+			let buffer = new bytes.Buffer()
+			try picture.write(buffer, ".png")
+			out.push(codec.encode(buffer.bytes()))
+		}
+		return out
+	}
+
+	// Fails with the RemoteError a reply's status and body describe when
+	// it is not a success.
+	internal def checked(res http.Response) !none {
+		return none when res.ok()
+		let text = res.text() onerror recover ""
+		let said = new ErrorWire()
+		(new JSON()).decode(text, said) onerror recover none
+		let message = said.error.len() > 0 ?? (said.error, text.len() > 0 ?? (text.trim(), res.reason))
+		res.close() onerror recover none
+		fail RemoteError{message: "ollama: {message}", code: remoteErrorKind(res.status).value, kind: remoteErrorKind(res.status), status: res.status, remoteCode: "", retryAfter: res.retryAfter()}
+	}
+
+	// Decodes a whole reply's JSON onto `target`.
+	internal def decodeBody(res http.Response, target any) !none {
+		let text = try res.text()
+		(new JSON()).decode(text, target) onerror (err error) {
+			fail RemoteError{message: "ollama: the reply is not the JSON expected: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol, status: res.status}
+		}
+		return none
+	}
 }

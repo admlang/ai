@@ -1,3 +1,431 @@
+// A Gemini API client over std.net.http, for Google's models through an
+// API key. Its conversations are std.ai.llm's: `chat()` gives a
+// `llm.RemoteChat`, with tools, `@tool` methods, MCP tools, pictures,
+// sound, documents and uploaded files as a local `llm.Session` takes
+// them; `embedder` gives a `std.ai.embeddings.Embedder`.
+//
+// ```
+// let ai = new gemini.Client(model = "gemini-flash-latest")   // GEMINI_API_KEY
+// let chat = ai.chat()
+// print(try chat.say("Name three primes."))
+// ```
 partial module adm.ai.gemini {
-	// Gemini API over std.net.http: generateContent and streaming, function calling, embeddings, files, context caching, grounding
+	use (
+		std.bytes
+		std.net.http
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON, Base64)
+		std.formats.image::(Image)
+		std.formats.audio
+		std.formats.audio::(Audio, PCM)
+		std.formats.docs
+		std.ai.llm::(RemoteChat, ChatRequest, ReplyStream, RemoteError, RemoteErrorKind, Message, Role, Reasoning, schemaOf, remoteErrorKind)
+	)
+
+	// Google's address of the Gemini API, version v1beta.
+	const geminiURL = "https://generativelanguage.googleapis.com/v1beta"
+
+	// What starts the parts of a reply kept in `Message.providerState`
+	// (with its grounding), so another provider's state is told apart.
+	const partsState = "gemini "
+
+	// The harm categories safety settings name.
+	enum HarmCategory {
+		Harassment       = "HARM_CATEGORY_HARASSMENT",
+		HateSpeech       = "HARM_CATEGORY_HATE_SPEECH",
+		SexuallyExplicit = "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+		DangerousContent = "HARM_CATEGORY_DANGEROUS_CONTENT",
+		CivicIntegrity   = "HARM_CATEGORY_CIVIC_INTEGRITY",
+	}
+
+	// From which likelihood of harm a reply is blocked.
+	enum Threshold {
+		// Blocks nothing.
+		None             = "BLOCK_NONE",
+		// Blocks only high likelihood.
+		OnlyHigh         = "BLOCK_ONLY_HIGH",
+		MediumAndAbove   = "BLOCK_MEDIUM_AND_ABOVE",
+		LowAndAbove      = "BLOCK_LOW_AND_ABOVE",
+		// Blocks nothing and reports no ratings.
+		Off              = "OFF",
+	}
+
+	// One safety setting: block `category` from `threshold`.
+	struct SafetySetting {
+		category  HarmCategory
+		threshold Threshold
+	}
+
+	// A connection to the Gemini API: the key, the model new conversations
+	// use, and settings every request carries. It holds no connection of
+	// its own (std.net.http keeps them), so any number of tasks may share
+	// it.
+	//
+	// Requests fail with `llm.RemoteError`: Auth for a missing or wrong
+	// key, RateLimited when a quota is used up (the client retries 429s
+	// first), Overloaded when the model is busy, BadRequest for a request
+	// the API refuses, NotFound, Server for its own failures, Transport
+	// when it cannot be reached.
+	partial type Client {
+		// The model `chat()` uses ("gemini-flash-latest"); a conversation
+		// keeps its own copy, which can change between replies.
+		model           string
+		apiKey          ?Secret<string>
+		// The API's base: `https://generativelanguage.googleapis.com/v1beta`.
+		baseURL         string
+		// Streams a summary of the thinking as thinking text.
+		includeThoughts bool            = true
+		// A thinking budget in tokens (Gemini 2.5): -1 lets the model
+		// choose, 0 turns thinking off; none maps the conversation's
+		// `reasoning` to a thinking level (Gemini 3).
+		thinkingBudget  ?int            = none
+		// Lets the model search Google and cite what it found.
+		googleSearch    bool            = false
+		// Lets the model read the web pages the prompt names.
+		urlContext      bool            = false
+		// Lets the model write and run Python, its code and output streamed
+		// as text.
+		codeExecution   bool            = false
+		safety          SafetySetting[]
+		// A context cache (`caches.create`) the conversation follows: its
+		// contents come before the conversation's.
+		cachedContent   string          = ""
+		// The HTTP client requests go through: headers, timeouts, a
+		// transport. Quota and busy replies are sent again (`retry`).
+		httpClient      http.Client
+
+		// A client with `apiKey` (else `GEMINI_API_KEY`, else
+		// `GOOGLE_API_KEY`), of the API at `baseURL` (else Google's).
+		def new(model string = "", apiKey ?Secret<string> = none, baseURL string = "") {
+			self.model = model
+			let gemini = Runtime.getEnv("GEMINI_API_KEY")
+			let google = Runtime.getEnv("GOOGLE_API_KEY")
+			let found = gemini is none ?? (google is none ?? ("", google), gemini)
+			self.apiKey = apiKey is none ?? (found.len() > 0 ?? (found, none), apiKey)
+			self.baseURL = (baseURL.len() > 0 ?? (baseURL, geminiURL)).trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.retry = http.RetryPolicy{attempts: 3, statuses: [429, 500, 502, 503, 504], allMethods: true}
+		}
+
+		// A conversation with `model` (none: the client's). It is a
+		// `llm.Chat`.
+		def chat(model string = "") RemoteChat {
+			return new RemoteChat(self, model.len() > 0 ?? (model, self.model))
+		}
+
+		// Sends `request` to streamGenerateContent and returns the reply as
+		// it streams: what `RemoteChat` calls. Implements
+		// `llm.ChatProvider`.
+		// Fails with RemoteError when the API refuses the request.
+		def reply(request ChatRequest) !ReplyStream {
+			let body = try contentBody(self, request)
+			let res = try post(self, "/{modelPath(request.model)}:streamGenerateContent?alt=sse", body)
+			return new ContentStream(res)
+		}
+
+		// The vectors of an embedding model ("gemini-embedding-001") for
+		// `task`; `dimensions` shortens them (0 for the model's size). It is
+		// a `std.ai.embeddings.Embedder`.
+		def embedder(model string = "gemini-embedding-001", task TaskType = TaskType.Unspecified, dimensions int = 0) Embeddings {
+			return new Embeddings(self, model, task, dimensions)
+		}
+	}
+
+	// "models/x" for a model's name, which may already be one.
+	internal def modelPath(model string) string {
+		return model.startsWith("models/") || model.startsWith("tunedModels/") ?? (model, "models/" + model)
+	}
+
+	// The body of generateContent for `request`.
+	internal def contentBody(client Client, request ChatRequest) !map<string, any> {
+		let contents any[] = []
+		for let (_, m) in request.messages {
+			try addContent(contents, m, request.messages)
+		}
+		let body = map<string, any>{"contents": contents}
+		body.set("systemInstruction", map<string, any>{"parts": anyList(map<string, any>{"text": request.system})}) when request.system.len() > 0
+		let tools any[] = []
+		if request.tools.len() > 0 {
+			let declarations any[] = []
+			for let (_, t) in request.tools {
+				declarations.push(map<string, any>{"name": t.name, "description": t.description, "parametersJsonSchema": schemaOf(t)})
+			}
+			tools.push(map<string, any>{"functionDeclarations": declarations})
+		}
+		tools.push(map<string, any>{"googleSearch": new map<string, any>()}) when client.googleSearch
+		tools.push(map<string, any>{"urlContext": new map<string, any>()}) when client.urlContext
+		tools.push(map<string, any>{"codeExecution": new map<string, any>()}) when client.codeExecution
+		body.set("tools", tools) when tools.len() > 0
+		let config = new map<string, any>()
+		config.set("maxOutputTokens", request.limit) when request.limit > 0
+		config.set("temperature", request.temperature) unless request.temperature is none
+		config.set("topP", request.topP) unless request.topP is none
+		config.set("topK", request.topK) unless request.topK is none
+		config.set("seed", int(request.seed)) unless request.seed is none
+		if request.stopAt.len() > 0 {
+			let stops any[] = []
+			for let (_, s) in request.stopAt {
+				stops.push(s)
+			}
+			config.set("stopSequences", stops)
+		}
+		let thinking = thinkingOf(client, request)
+		config.set("thinkingConfig", thinking) when thinking.len() > 0
+		let schema = request.schema
+		if !(schema is none) {
+			config.set("responseMimeType", "application/json")
+			config.set("responseJsonSchema", schema)
+		}
+		body.set("generationConfig", config) when config.len() > 0
+		if client.safety.len() > 0 {
+			let settings any[] = []
+			for let (_, s) in client.safety {
+				settings.push(map<string, any>{"category": s.category.value, "threshold": s.threshold.value})
+			}
+			body.set("safetySettings", settings)
+		}
+		body.set("cachedContent", client.cachedContent) when client.cachedContent.len() > 0
+		return body
+	}
+
+	// The thinking settings of a request: the client's budget, else the
+	// conversation's on/off and level.
+	internal def thinkingOf(client Client, request ChatRequest) map<string, any> {
+		let out = new map<string, any>()
+		let thinking = request.thinking
+		let off = thinking is bool && !thinking
+		let budget = client.thinkingBudget
+		if !(budget is none) {
+			out.set("thinkingBudget", budget)
+		} else if off {
+			// Gemini 2.5 turns thinking off with a budget of 0; Gemini 3
+			// thinks at least minimally.
+			if request.model.contains("gemini-2") {
+				out.set("thinkingBudget", 0)
+			} else {
+				out.set("thinkingLevel", "minimal")
+			}
+		} else {
+			let level = request.reasoning
+			if level is Reasoning {
+				match level {
+					case Reasoning.Low:
+						out.set("thinkingLevel", "low")
+					case Reasoning.Medium:
+						out.set("thinkingLevel", "medium")
+					case Reasoning.High:
+						out.set("thinkingLevel", "high")
+				}
+			}
+		}
+		out.set("includeThoughts", true) when client.includeThoughts && !off
+		return out
+	}
+
+	// Adds message `m` to the API's contents. A tool's result joins the
+	// user content before it when that holds results too: a reply's calls
+	// are answered in one content.
+	internal def addContent(contents any[], m Message, all Message[]) !none {
+		match m.role {
+			case Role.System:
+				contents.push(map<string, any>{"role": "user", "parts": anyList(map<string, any>{"text": m.text})})
+			case Role.Tool:
+				let answer = map<string, any>{"name": callName(all, m.callId), "response": map<string, any>{"result": m.text}}
+				answer.set("id", m.callId) unless m.callId.startsWith("call_made_")
+				let part = map<string, any>{"functionResponse": answer}
+				let joined = resultsContent(contents)
+				if joined is map<string, any> {
+					let parts = joined.get("parts")
+					if parts is any[] {
+						parts.push(part)
+						joined.set("parts", parts)
+						return none
+					}
+				}
+				contents.push(map<string, any>{"role": "user", "parts": anyList(part)})
+			case Role.Assistant:
+				contents.push(map<string, any>{"role": "model", "parts": modelParts(m)})
+			case Role.User:
+				let parts any[] = []
+				let codec = new Base64()
+				for let (_, picture) in m.images {
+					parts.push(map<string, any>{"inlineData": map<string, any>{"mimeType": "image/png", "data": codec.encode(try pngOf(picture))}})
+				}
+				for let (_, sound) in m.audio {
+					parts.push(map<string, any>{"inlineData": map<string, any>{"mimeType": "audio/wav", "data": codec.encode(try wavOf(sound))}})
+				}
+				for let (_, file) in m.files {
+					parts.push(map<string, any>{"fileData": map<string, any>{"mimeType": file.mediaType, "fileUri": file.id}})
+				}
+				for let (_, doc) in m.documents {
+					parts.push(map<string, any>{"text": new docs.Markdown().encode(doc)})
+				}
+				parts.push(map<string, any>{"text": m.text}) when m.text.len() > 0
+				contents.push(map<string, any>{"role": "user", "parts": parts})
+		}
+		return none
+	}
+
+	// The last content when it holds function results, which the next
+	// result joins; none otherwise.
+	internal def resultsContent(contents any[]) ?map<string, any> {
+		return none when contents.len() == 0
+		let last = contents[contents.len() - 1]
+		return none unless last is map<string, any>
+		let parts = last.get("parts")
+		return none unless parts is any[] && parts.len() > 0
+		let first = parts[0]
+		return first is map<string, any> && !(first.get("functionResponse") is none) ?? (last, none)
+	}
+
+	// The parts of a model message: the reply's parts as the API sent them
+	// (thought signatures with them) when the message keeps them, else
+	// built from its text and calls.
+	internal def modelParts(m Message) any[] {
+		let state = stateOf(m)
+		let kept = state.get("parts")
+		return kept when kept is any[]
+		let parts any[] = []
+		parts.push(map<string, any>{"text": m.text}) when m.text.len() > 0
+		for let (_, c) in m.calls {
+			let args = (new JSON()).parse(c.arguments.len() > 0 ?? (c.arguments, "\{}")) onerror recover new map<string, any>()
+			let call = map<string, any>{"name": c.name, "args": args}
+			call.set("id", c.id) unless c.id.startsWith("call_made_")
+			parts.push(map<string, any>{"functionCall": call})
+		}
+		return parts
+	}
+
+	// What a Gemini reply kept in its message: its parts and grounding;
+	// empty for a message without one.
+	internal def stateOf(m Message) map<string, any> {
+		return new map<string, any>() unless m.providerState.startsWith(partsState)
+		let parsed = (new JSON()).parse(m.providerState.slice(partsState.len())) onerror recover none
+		return parsed is map<string, any> ?? (parsed, new map<string, any>())
+	}
+
+	// The name of the function the call `id` asked for, "" when no message
+	// holds it.
+	internal def callName(all Message[], id string) string {
+		for let (_, m) in all {
+			for let (_, c) in m.calls {
+				return c.name when c.id == id
+			}
+		}
+		return ""
+	}
+
+	// A JSON request to the API. Fails with the RemoteError the reply
+	// describes when it is not a success.
+	internal def post(client Client, path string, body map<string, any>) !http.Response {
+		let req = try request(client, http.Method.POST, client.baseURL + path)
+		req.replaceBody((new JSON()).encode(body))
+		req.headers.set("Content-Type", "application/json")
+		return try sent(client, req)
+	}
+
+	internal def request(client Client, method http.Method, target string) !http.Request {
+		let req = try client.httpClient.request(method, target)
+		let key = client.apiKey
+		req.headers.set("x-goog-api-key", key.reveal()) unless key is none
+		return req
+	}
+
+	internal def sent(client Client, req http.Request) !http.Response {
+		let res = client.httpClient.do(req) onerror (err error) {
+			fail RemoteError{message: "gemini: {client.baseURL}: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+		}
+		try checked(res)
+		return res
+	}
+
+	// Fails with the RemoteError a reply's status and body describe when
+	// it is not a success: `{"error": {"code", "message", "status"}}`.
+	internal def checked(res http.Response) !none {
+		return none when res.ok()
+		let text = res.text() onerror recover ""
+		res.close() onerror recover none
+		let parsed = (new JSON()).parse(text) onerror recover none
+		let error = parsed is map<string, any> ?? (objectAt(parsed, "error"), new map<string, any>())
+		let message = textAt(error, "message")
+		let status = textAt(error, "status")
+		fail RemoteError{message: "gemini: {message.len() > 0 ?? (message, text.len() > 0 ?? (text.trim(), res.reason))}", code: kindOf(status, res.status).value, kind: kindOf(status, res.status), status: res.status, remoteCode: status, retryAfter: res.retryAfter()}
+	}
+
+	// The kind of an error by its gRPC status name, else its HTTP status.
+	internal def kindOf(status string, code int) RemoteErrorKind {
+		match status {
+			case "RESOURCE_EXHAUSTED":
+				return RemoteErrorKind.RateLimited
+			case "UNAVAILABLE":
+				return RemoteErrorKind.Overloaded
+			case "UNAUTHENTICATED", "PERMISSION_DENIED":
+				return RemoteErrorKind.Auth
+			case "NOT_FOUND":
+				return RemoteErrorKind.NotFound
+			case "INVALID_ARGUMENT", "FAILED_PRECONDITION", "OUT_OF_RANGE":
+				return RemoteErrorKind.BadRequest
+			case "INTERNAL", "UNKNOWN", "DEADLINE_EXCEEDED":
+				return RemoteErrorKind.Server
+			default:
+				return remoteErrorKind(code)
+		}
+	}
+
+	internal def pngOf(picture Image) !byte[] {
+		let buffer = new bytes.Buffer()
+		try picture.write(buffer, ".png")
+		return buffer.bytes()
+	}
+
+	internal def wavOf(sound Audio) !byte[] {
+		let pcm = new PCM()
+		pcm.info = sound.info
+		pcm.samples = sound.samples
+		let buffer = new bytes.Buffer()
+		try audio.write(pcm.stream(), buffer, ".wav")
+		return buffer.bytes()
+	}
+
+	// A list of one value.
+	internal def anyList(value any) any[] {
+		let out any[] = []
+		out.push(value)
+		return out
+	}
+
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return v when v is string
+		return "{v}" when v is int
+		return ""
+	}
+
+	internal def intAt(object map<string, any>, key string) int {
+		let v = object.get(key)
+		return v when v is int
+		return int(v) when v is float
+		return v.isNumeric() ?? (v.toInt<int>(), 0) when v is string
+		return 0
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
+
+	internal def listAt(object map<string, any>, key string) any[] {
+		let v = object.get(key)
+		return v is any[] ?? (v, any[])
+	}
+
+	// A whole reply's JSON object.
+	internal def objectOf(res http.Response) !map<string, any> {
+		let text = try res.text()
+		let parsed = (new JSON()).parse(text) onerror (err error) {
+			fail RemoteError{message: "gemini: the reply is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol, status: res.status}
+		}
+		fail RemoteError{message: "gemini: the reply is not a JSON object", code: "protocol", kind: RemoteErrorKind.Protocol, status: res.status} unless parsed is map<string, any>
+		return parsed
+	}
 }

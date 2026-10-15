@@ -1,0 +1,389 @@
+partial module adm.ai.openai {
+	use (
+		std.os
+		std.time
+		std.net.http
+		std.net.url
+	)
+
+	// A model the API offers.
+	struct ModelInfo {
+		id      string
+		// Who made it: "openai", "system", an organization.
+		owner   string
+		created ?time.Time
+	}
+
+	// What an uploaded file is for.
+	enum Purpose {
+		Assistants = "assistants",
+		Batch      = "batch",
+		FineTune   = "fine-tune",
+		Vision     = "vision",
+		UserData   = "user_data",
+		Evals      = "evals",
+	}
+
+	// A file uploaded to the API.
+	struct FileInfo {
+		id       string
+		filename string
+		bytes    int
+		purpose  string
+		created  ?time.Time
+		// When the API deletes it; none for never.
+		expires  ?time.Time
+	}
+
+	// How many files of a vector store are in each state.
+	struct FileCounts {
+		inProgress int
+		completed  int
+		failed     int
+		cancelled  int
+		total      int
+	}
+
+	// A vector store: files cut into chunks and embedded, for search.
+	struct VectorStore {
+		id         string
+		name       string
+		// "in_progress", "completed", "expired".
+		status     string
+		files      FileCounts
+		usageBytes int
+		created    ?time.Time
+		expires    ?time.Time
+	}
+
+	// A file of a vector store.
+	struct StoredFile {
+		id         string
+		// "in_progress", "completed", "cancelled", "failed".
+		status     string
+		// Why it failed; "" when it did not.
+		error      string
+		usageBytes int
+	}
+
+	// A piece of a vector store's files that matched a search.
+	struct SearchHit {
+		fileId   string
+		filename string
+		score    float
+		text     string
+	}
+
+	// How many requests of a batch are in each state.
+	struct RequestCounts {
+		total     int
+		completed int
+		failed    int
+	}
+
+	// A batch of requests run within a time window at half the price.
+	struct Batch {
+		id           string
+		// "validating", "in_progress", "finalizing", "completed", "failed",
+		// "expired", "cancelling", "cancelled".
+		status       string
+		endpoint     string
+		inputFileId  string
+		// The results (JSON lines, one per request) once completed.
+		outputFileId string
+		// The requests that failed, as JSON lines.
+		errorFileId  string
+		requests     RequestCounts
+		created      ?time.Time
+		completed    ?time.Time
+	}
+
+	partial type Client {
+		// The models the API offers.
+		// Fails with RemoteError when the API cannot be asked.
+		def models() !ModelInfo[] {
+			let out ModelInfo[]
+			for let (_, item) in try listAll(self, "/models") {
+				out.push(modelOf(item))
+			}
+			return out
+		}
+
+		// The model `id`.
+		// Fails with RemoteError NotFound when there is none.
+		def modelInfo(id string) !ModelInfo {
+			return modelOf(try objectOf(try fetch(self, "/models/" + url.pathEscape(id))))
+		}
+
+		// Files uploaded to the API: upload, list, get, delete, content.
+		files Files {
+			def get() Files {
+				return new Files(self)
+			}
+		}
+
+		// Vector stores: create, list, get, rename, delete, their files,
+		// search.
+		vectorStores VectorStores {
+			def get() VectorStores {
+				return new VectorStores(self)
+			}
+		}
+
+		// Batches of requests: create, get, list, cancel.
+		batches Batches {
+			def get() Batches {
+				return new Batches(self)
+			}
+		}
+	}
+
+	// The file endpoints of a client (`ai.files`).
+	type Files {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Uploads `data` as `filename` for `purpose`.
+		// Fails with RemoteError when the API refuses the file.
+		def upload(data byte[], filename string, purpose Purpose) !FileInfo {
+			let form = new Form()
+			try form.field("purpose", purpose.value)
+			try form.file("file", filename, data)
+			return fileOf(try objectOf(try postForm(client, "/files", form)))
+		}
+
+		// Uploads the file at `path` for `purpose`.
+		// Fails when the file cannot be read, or like the other `upload`.
+		def upload(path string, purpose Purpose) !FileInfo {
+			return try upload(try os.readFile(path), os.base(path), purpose)
+		}
+
+		// Every file uploaded, or those for `purpose`.
+		// Fails with RemoteError when the API cannot be asked.
+		def list(purpose ?Purpose = none) !FileInfo[] {
+			let wanted = purpose
+			let out FileInfo[]
+			for let (_, item) in try listAll(client, wanted is none ?? ("/files", "/files?purpose=" + wanted.value)) {
+				out.push(fileOf(item))
+			}
+			return out
+		}
+
+		// The file `id`.
+		// Fails with RemoteError NotFound when there is none.
+		def get(id string) !FileInfo {
+			return fileOf(try objectOf(try fetch(client, "/files/" + url.pathEscape(id))))
+		}
+
+		// The bytes of the file `id` (a batch's results, among others).
+		// Fails like `get`.
+		def content(id string) !byte[] {
+			let res = try fetch(client, "/files/" + url.pathEscape(id) + "/content")
+			return try res.bytes()
+		}
+
+		// Deletes the file `id`.
+		// Fails like `get`.
+		def delete(id string) !none {
+			try objectOf(try remove(client, "/files/" + url.pathEscape(id)))
+			return none
+		}
+	}
+
+	// The vector store endpoints of a client (`ai.vectorStores`).
+	type VectorStores {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// A new store `name` holding `files` (ids of uploaded files),
+		// deleted `expiresAfter` days after it was last used (0 for never).
+		// Fails with RemoteError when the API refuses it.
+		def create(name string, files string[] = string[], expiresAfter int = 0) !VectorStore {
+			let body = map<string, any>{"name": name}
+			body.set("file_ids", texts(files)) when files.len() > 0
+			body.set("expires_after", map<string, any>{"anchor": "last_active_at", "days": expiresAfter}) when expiresAfter > 0
+			return storeOf(try objectOf(try post(client, "/vector_stores", body)))
+		}
+
+		// Every store.
+		// Fails with RemoteError when the API cannot be asked.
+		def list() !VectorStore[] {
+			let out VectorStore[]
+			for let (_, item) in try listAll(client, "/vector_stores") {
+				out.push(storeOf(item))
+			}
+			return out
+		}
+
+		// The store `id`.
+		// Fails with RemoteError NotFound when there is none.
+		def get(id string) !VectorStore {
+			return storeOf(try objectOf(try fetch(client, "/vector_stores/" + url.pathEscape(id))))
+		}
+
+		// Renames the store `id`.
+		// Fails like `get`.
+		def rename(id string, name string) !VectorStore {
+			return storeOf(try objectOf(try post(client, "/vector_stores/" + url.pathEscape(id), map<string, any>{"name": name})))
+		}
+
+		// Deletes the store `id` (its files stay uploaded).
+		// Fails like `get`.
+		def delete(id string) !none {
+			try objectOf(try remove(client, "/vector_stores/" + url.pathEscape(id)))
+			return none
+		}
+
+		// Adds the uploaded file `fileId` to the store `id`.
+		// Fails like `get`, or when there is no such file.
+		def add(id string, fileId string) !StoredFile {
+			return storedOf(try objectOf(try post(client, "/vector_stores/{url.pathEscape(id)}/files", map<string, any>{"file_id": fileId})))
+		}
+
+		// The files of the store `id`.
+		// Fails like `get`.
+		def files(id string) !StoredFile[] {
+			let out StoredFile[]
+			for let (_, item) in try listAll(client, "/vector_stores/{url.pathEscape(id)}/files") {
+				out.push(storedOf(item))
+			}
+			return out
+		}
+
+		// Takes the file `fileId` out of the store `id`.
+		// Fails like `get`.
+		def removeFile(id string, fileId string) !none {
+			try objectOf(try remove(client, "/vector_stores/{url.pathEscape(id)}/files/{url.pathEscape(fileId)}"))
+			return none
+		}
+
+		// The pieces of the store's files nearest to `query`, at most
+		// `limit` (1 to 50).
+		// Fails like `get`.
+		def search(id string, query string, limit int = 10) !SearchHit[] {
+			let reply = try objectOf(try post(client, "/vector_stores/{url.pathEscape(id)}/search", map<string, any>{"query": query, "max_num_results": limit}))
+			let out SearchHit[]
+			for let (_, item) in listAt(reply, "data") {
+				continue unless item is map<string, any>
+				let text = ""
+				for let (_, part) in listAt(item, "content") {
+					text += textAt(part, "text") when part is map<string, any>
+				}
+				let score = item.get("score")
+				out.push(SearchHit{fileId: textAt(item, "file_id"), filename: textAt(item, "filename"), score: score is float ?? (score, 0.0), text: text})
+			}
+			return out
+		}
+	}
+
+	// The batch endpoints of a client (`ai.batches`).
+	type Batches {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Runs the requests of the uploaded file `inputFileId` (JSON lines,
+		// purpose Batch) against `endpoint` ("/v1/responses",
+		// "/v1/chat/completions", "/v1/embeddings") within 24 hours.
+		// Fails with RemoteError when the API refuses the batch.
+		def create(inputFileId string, endpoint string = "/v1/responses") !Batch {
+			return batchOf(try objectOf(try post(client, "/batches", map<string, any>{"input_file_id": inputFileId, "endpoint": endpoint, "completion_window": "24h"})))
+		}
+
+		// The batch `id`, as it is now.
+		// Fails with RemoteError NotFound when there is none.
+		def get(id string) !Batch {
+			return batchOf(try objectOf(try fetch(client, "/batches/" + url.pathEscape(id))))
+		}
+
+		// Every batch.
+		// Fails with RemoteError when the API cannot be asked.
+		def list() !Batch[] {
+			let out Batch[]
+			for let (_, item) in try listAll(client, "/batches") {
+				out.push(batchOf(item))
+			}
+			return out
+		}
+
+		// Stops the batch `id`; what finished stays in its output.
+		// Fails like `get`.
+		def cancel(id string) !Batch {
+			return batchOf(try objectOf(try post(client, "/batches/{url.pathEscape(id)}/cancel", new map<string, any>())))
+		}
+	}
+
+	internal def fetch(client Client, path string) !http.Response {
+		return try sent(client, try request(client, http.Method.GET, path))
+	}
+
+	internal def remove(client Client, path string) !http.Response {
+		return try sent(client, try request(client, http.Method.DELETE, path))
+	}
+
+	// Every item of a listing, following its pages (`has_more`, `after`).
+	internal def listAll(client Client, path string) !map<string, any>[] {
+		let out map<string, any>[]
+		let after = ""
+		for {
+			let joiner = path.contains("?") ?? ("&", "?")
+			let page = try objectOf(try fetch(client, after.len() > 0 ?? ("{path}{joiner}after={url.queryEscape(after)}", path)))
+			let items = listAt(page, "data")
+			for let (_, item) in items {
+				out.push(item) when item is map<string, any>
+			}
+			let more = page.get("has_more")
+			break unless more is bool && more && items.len() > 0
+			let last = items[items.len() - 1]
+			after = last is map<string, any> ?? (textAt(last, "id"), "")
+			break when after.len() == 0
+		}
+		return out
+	}
+
+	// A string list as JSON values.
+	internal def texts(list string[]) any[] {
+		let out any[] = []
+		for let (_, s) in list {
+			out.push(s)
+		}
+		return out
+	}
+
+	// A time in seconds since 1970, none when absent or 0.
+	internal def unixAt(object map<string, any>, key string) ?time.Time {
+		let seconds = intAt(object, key)
+		return none when seconds == 0
+		return time.fromUnixNs(seconds * 1000000000)
+	}
+
+	internal def modelOf(item map<string, any>) ModelInfo {
+		return ModelInfo{id: textAt(item, "id"), owner: textAt(item, "owned_by"), created: unixAt(item, "created")}
+	}
+
+	internal def fileOf(item map<string, any>) FileInfo {
+		return FileInfo{id: textAt(item, "id"), filename: textAt(item, "filename"), bytes: intAt(item, "bytes"), purpose: textAt(item, "purpose"), created: unixAt(item, "created_at"), expires: unixAt(item, "expires_at")}
+	}
+
+	internal def storeOf(item map<string, any>) VectorStore {
+		let counts = objectAt(item, "file_counts")
+		return VectorStore{id: textAt(item, "id"), name: textAt(item, "name"), status: textAt(item, "status"), files: FileCounts{inProgress: intAt(counts, "in_progress"), completed: intAt(counts, "completed"), failed: intAt(counts, "failed"), cancelled: intAt(counts, "cancelled"), total: intAt(counts, "total")}, usageBytes: intAt(item, "usage_bytes"), created: unixAt(item, "created_at"), expires: unixAt(item, "expires_at")}
+	}
+
+	internal def storedOf(item map<string, any>) StoredFile {
+		return StoredFile{id: textAt(item, "id"), status: textAt(item, "status"), error: textAt(objectAt(item, "last_error"), "message"), usageBytes: intAt(item, "usage_bytes")}
+	}
+
+	internal def batchOf(item map<string, any>) Batch {
+		let counts = objectAt(item, "request_counts")
+		return Batch{id: textAt(item, "id"), status: textAt(item, "status"), endpoint: textAt(item, "endpoint"), inputFileId: textAt(item, "input_file_id"), outputFileId: textAt(item, "output_file_id"), errorFileId: textAt(item, "error_file_id"), requests: RequestCounts{total: intAt(counts, "total"), completed: intAt(counts, "completed"), failed: intAt(counts, "failed")}, created: unixAt(item, "created_at"), completed: unixAt(item, "completed_at")}
+	}
+}

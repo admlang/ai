@@ -1,0 +1,302 @@
+partial module adm.ai.ollama {
+	use (
+		std.os
+		std.io
+		std.time
+		std.net.http
+		std.crypto.hash
+		std.data.encoding::(JSON)
+		std.ai.llm::(Message, RemoteError, RemoteErrorKind)
+		adm.ai.ollama.wire::*
+	)
+
+	// What a model is: the server's summary of its file.
+	struct ModelDetails {
+		// "gguf", or "safetensors" for a model imported as such.
+		format       string
+		family       string
+		families     string[]
+		// "8.2B".
+		parameters   string
+		// "Q4_K_M".
+		quantization string
+		// The model this one was made from; "" for none.
+		parent       string
+	}
+
+	// A model the server has (`models`).
+	struct ModelInfo {
+		// "qwen3:4b".
+		name     string
+		// Bytes on disk.
+		size     int
+		digest   string
+		modified ?time.Time
+		details  ModelDetails
+	}
+
+	// A model the server has loaded (`running`).
+	struct RunningModel {
+		name          string
+		// Bytes it takes in memory, and the part of them on the GPU.
+		size          int
+		gpuSize       int
+		digest        string
+		// When the server unloads it unless a request comes first.
+		expires       ?time.Time
+		// The context it was loaded with; 0 when the server does not say.
+		contextLength int
+		details       ModelDetails
+	}
+
+	// Everything the server says about one model (`show`).
+	struct ModelDescription {
+		details      ModelDetails
+		// "completion", "tools", "thinking", "vision", "embedding", "insert".
+		capabilities string[]
+		// The Modelfile that would make the model again.
+		modelfile    string
+		// Its default model options, one `name value` a line.
+		parameters   string
+		template     string
+		system       string
+		license      string
+		// The file's metadata ("general.architecture", "llama.context_length").
+		info         map<string, any>
+		modified     ?time.Time
+	}
+
+	// A step of `pull`, `push` or `create`, as the server reports it.
+	struct Progress {
+		// "pulling manifest", "downloading", "verifying sha256 digest",
+		// "writing manifest", "success".
+		status    string
+		// The layer being moved; "" for a step that moves none.
+		digest    string
+		// Bytes of the layer, and those moved so far.
+		total     int
+		completed int
+	}
+
+	// How `create` quantizes the weights of the model it makes.
+	enum Quantization {
+		// As they are.
+		None   = "",
+		Q4KM   = "q4_K_M",
+		Q4KS   = "q4_K_S",
+		Q8_0   = "q8_0",
+		Int4   = "int4",
+		Int8   = "int8",
+		MXFP4  = "mxfp4",
+		MXFP8  = "mxfp8",
+		NVFP4  = "nvfp4",
+	}
+
+	partial type Client {
+		// The models the server has, newest first as it lists them.
+		// Fails with RemoteError when the server cannot be asked.
+		def models() !ModelInfo[] {
+			let res = try send(self, http.Method.GET, "/api/tags", none)
+			let reply = new ModelsWire()
+			try decodeBody(res, reply)
+			let out ModelInfo[]
+			for let (_, m) in reply.models {
+				out.push(ModelInfo{name: m.name, size: m.size, digest: m.digest, modified: timeOf(m.modifiedAt), details: detailsOf(m.details)})
+			}
+			return out
+		}
+
+		// The models the server has loaded, with the memory they take.
+		// Fails like `models`.
+		def running() !RunningModel[] {
+			let res = try send(self, http.Method.GET, "/api/ps", none)
+			let reply = new ModelsWire()
+			try decodeBody(res, reply)
+			let out RunningModel[]
+			for let (_, m) in reply.models {
+				out.push(RunningModel{name: m.name, size: m.size, gpuSize: m.sizeVram, digest: m.digest, expires: timeOf(m.expiresAt), contextLength: m.contextLength, details: detailsOf(m.details)})
+			}
+			return out
+		}
+
+		// What the server knows of the model `name`.
+		// Fails with RemoteError NotFound when it does not have it.
+		def show(name string) !ModelDescription {
+			let res = try post(self, "/api/show", map<string, any>{"model": name})
+			let reply = new ShowWire()
+			try decodeBody(res, reply)
+			let info = reply.modelInfo
+			return ModelDescription{details: detailsOf(reply.details), capabilities: reply.capabilities, modelfile: reply.modelfile, parameters: reply.parameters, template: reply.template, system: reply.system, license: reply.license, info: info is map<string, any> ?? (info, new map<string, any>()), modified: timeOf(reply.modifiedAt)}
+		}
+
+		// Downloads the model `name` from its registry, calling `progress`
+		// for each step the server reports. `insecure` allows a registry
+		// without TLS of one's own.
+		// Fails with RemoteError when the registry does not have it or the
+		// download breaks.
+		def pull(name string, progress ?def (step Progress) = none, insecure bool = false) !none {
+			let res = try post(self, "/api/pull", map<string, any>{"model": name, "insecure": insecure, "stream": true})
+			return try follow(res, progress)
+		}
+
+		// Uploads the model `name` (`registry/namespace/model:tag`) to its
+		// registry, calling `progress` for each step.
+		// Fails with RemoteError when the registry refuses it.
+		def push(name string, progress ?def (step Progress) = none, insecure bool = false) !none {
+			let res = try post(self, "/api/push", map<string, any>{"model": name, "insecure": insecure, "stream": true})
+			return try follow(res, progress)
+		}
+
+		// Copies the model `source` to the new name `destination`.
+		// Fails with RemoteError NotFound when there is no `source`.
+		def copy(source string, destination string) !none {
+			let res = try post(self, "/api/copy", map<string, any>{"source": source, "destination": destination})
+			res.close() onerror recover none
+			return none
+		}
+
+		// Deletes the model `name` and the files no other model shares.
+		// Fails with RemoteError NotFound when there is no such model.
+		def delete(name string) !none {
+			let res = try send(self, http.Method.DELETE, "/api/delete", map<string, any>{"model": name})
+			res.close() onerror recover none
+			return none
+		}
+
+		// Makes the model `name` from the model `from` or from model `files`
+		// on this machine (GGUF files, or a safetensors folder's files),
+		// with `adapters` (LoRA files) on top, a chat `template`, a
+		// `system` message, a `license`, default model `parameters`
+		// ("temperature", "num_ctx", "stop"), example `messages`, and its
+		// weights quantized as `quantize` says. Files the server lacks are
+		// uploaded first. `progress` hears each step.
+		// Fails with RemoteError when the server refuses the model, or a
+		// file cannot be read or uploaded.
+		def create(name string, from string = "", files string[] = string[], adapters string[] = string[], template string = "", system string = "", license string = "", parameters map<string, any> = new map<string, any>(), messages Message[] = Message[], quantize Quantization = Quantization.None, progress ?def (step Progress) = none) !none {
+			let body = map<string, any>{"model": name, "stream": true}
+			body.set("from", from) when from.len() > 0
+			body.set("files", try uploaded(files)) when files.len() > 0
+			body.set("adapters", try uploaded(adapters)) when adapters.len() > 0
+			body.set("template", template) when template.len() > 0
+			body.set("system", system) when system.len() > 0
+			body.set("license", license) when license.len() > 0
+			body.set("parameters", parameters) when parameters.len() > 0
+			if messages.len() > 0 {
+				let list any[] = []
+				for let (_, m) in messages {
+					list.push(try messageOf(m, messages))
+				}
+				body.set("messages", list)
+			}
+			body.set("quantize", quantize.value) unless quantize == Quantization.None
+			let res = try post(self, "/api/create", body)
+			return try follow(res, progress)
+		}
+
+		// The digest of each file under its name, uploading those the
+		// server does not have.
+		internal def uploaded(paths string[]) !map<string, any> {
+			let out = new map<string, any>()
+			for let (_, path) in paths {
+				let digest = "sha256:" + (try fileDigest(path))
+				try uploadBlob(path, digest) unless try hasBlob(digest)
+				out.set(os.base(path), digest)
+			}
+			return out
+		}
+
+		// Whether the server has the file of `digest`.
+		internal def hasBlob(digest string) !bool {
+			let missing = false
+			let res = send(self, http.Method.HEAD, "/api/blobs/" + digest, none) onerror (err error) {
+				fail err unless err is RemoteError && err.kind == RemoteErrorKind.NotFound
+				missing = true
+				recover new http.Response()
+			}
+			res.close() onerror recover none
+			return !missing
+		}
+
+		internal def uploadBlob(path string, digest string) !none {
+			let file = os.open(path) onerror (err error) {
+				fail RemoteError{message: "ollama: cannot read {path}: {err.message}", code: "badrequest", cause: err, kind: RemoteErrorKind.BadRequest}
+			}
+			let info = try file.stat()
+			let req = try httpClient.request(http.Method.POST, host + "/api/blobs/" + digest, file)
+			req.contentLength = info.size
+			let secret = token
+			req.bearerToken(secret.reveal()) unless secret is none
+			let res = httpClient.do(req) onerror (err error) {
+				file.close() onerror recover none
+				fail RemoteError{message: "ollama: uploading {path}: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+			}
+			file.close() onerror recover none
+			try checked(res)
+			res.close() onerror recover none
+			return none
+		}
+	}
+
+	// Reads a streamed progress reply to its end, calling `progress` for
+	// each step. Fails with RemoteError when a line reports an error.
+	internal def follow(res http.Response, progress ?def (step Progress)) !none {
+		let lines = new http.WireReader(bodyOf(res))
+		let codec = new JSON()
+		for {
+			let line = lines.readLine() onerror (err error) {
+				res.close() onerror recover none
+				fail RemoteError{message: "ollama: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+			}
+			break when line is none
+			continue when line.trim().len() == 0
+			let step = new ProgressWire()
+			codec.decode(line, step) onerror (err error) {
+				res.close() onerror recover none
+				fail RemoteError{message: "ollama: a line of the reply is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+			}
+			if step.error.len() > 0 {
+				res.close() onerror recover none
+				fail RemoteError{message: "ollama: {step.error}", code: "server", kind: RemoteErrorKind.Server, status: res.status}
+			}
+			let call = progress
+			call(Progress{status: step.status, digest: step.digest, total: step.total, completed: step.completed}) unless call is none
+		}
+		res.close() onerror recover none
+		return none
+	}
+
+	// The SHA-256 of a file's bytes, in hex, read a piece at a time.
+	internal def fileDigest(path string) !string {
+		let file = os.open(path) onerror (err error) {
+			fail RemoteError{message: "ollama: cannot read {path}: {err.message}", code: "badrequest", cause: err, kind: RemoteErrorKind.BadRequest}
+		}
+		let digest = new hash.SHA256()
+		let piece byte[]
+		piece.len(1 << 20)
+		for {
+			let n = file.read(piece) onerror (err error) {
+				file.close() onerror recover none
+				fail err
+			}
+			break when n <= 0
+			digest.write(piece[:n])
+		}
+		file.close() onerror recover none
+		return digest.hash().hex()
+	}
+
+	internal def detailsOf(d DetailsWire) ModelDetails {
+		return ModelDetails{format: d.format, family: d.family, families: d.families, parameters: d.parameterSize, quantization: d.quantizationLevel, parent: d.parentModel}
+	}
+
+	// An RFC 3339 time as the server writes it; none when empty or not one.
+	internal def timeOf(text string) ?time.Time {
+		return none when text.len() == 0
+		let bad = false
+		let at = time.parse(text) onerror (err error) {
+			bad = true
+			recover time.now()
+		}
+		return bad ?? (none, at)
+	}
+}

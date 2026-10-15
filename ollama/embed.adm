@@ -1,0 +1,49 @@
+partial module adm.ai.ollama {
+	use (
+		adm.ai.ollama.wire::*
+		std.ai.llm::(RemoteError, RemoteErrorKind)
+	)
+
+	// An embedding model on the server (/api/embed). It is a
+	// `std.ai.embeddings.Embedder`, as a model loaded on this machine is.
+	type Embeddings {
+		// The server's name of the model ("nomic-embed-text").
+		model           string
+		// Values of each vector where the model can shorten them; 0 for
+		// its own size.
+		dimensions      int
+		// Whether a text longer than the model's context is cut to fit;
+		// false makes such a text fail.
+		truncate        bool   = true
+		internal client Client
+
+		def new(client Client, model string, dimensions int = 0) {
+			self.client = client
+			self.model = model
+			self.dimensions = dimensions
+		}
+
+		// The vector of `text`.
+		// Fails with RemoteError when the server refuses the text.
+		def embed(text string) !float32[] {
+			return (try embed(string[text]))[0]
+		}
+
+		// The vector of each text, in order.
+		// Fails with RemoteError when the server refuses a text.
+		def embed(texts string[]) !float32[][] {
+			let input any[] = []
+			for let (_, t) in texts {
+				input.push(t)
+			}
+			let body = map<string, any>{"model": model, "input": input, "truncate": truncate}
+			body.set("dimensions", dimensions) when dimensions > 0
+			body.set("keep_alive", keepAliveOf(client.keepAlive)) unless client.keepAlive is none
+			let res = try post(client, "/api/embed", body)
+			let reply = new EmbedWire()
+			try decodeBody(res, reply)
+			fail RemoteError{message: "ollama: {reply.embeddings.len()} embeddings for {texts.len()} texts", code: "protocol", kind: RemoteErrorKind.Protocol, status: res.status} unless reply.embeddings.len() == texts.len()
+			return reply.embeddings
+		}
+	}
+}

@@ -1,0 +1,45 @@
+partial module adm.ai.openai {
+	use (
+		std.bytes
+		std.net.multipart
+	)
+
+	// A multipart/form-data body being built: the fields and files of an
+	// upload.
+	internal type Form {
+		internal buffer bytes.Buffer
+		internal writer multipart.Writer
+
+		def new() {
+			buffer = new bytes.Buffer()
+			writer = new multipart.Writer(buffer)
+		}
+
+		// Adds a text field. Fails when the body cannot be written.
+		def field(name string, value string) !none {
+			return writer.writeField(name, value)
+		}
+
+		// Adds a file part of `data` named `filename`, of `mediaType`.
+		// Fails when the body cannot be written.
+		def file(name string, filename string, data byte[], mediaType string = "application/octet-stream") !none {
+			let headers = new map<string, string[]>()
+			headers.set("Content-Disposition", string["form-data; name=\"{name}\"; filename=\"{filename}\""])
+			headers.set("Content-Type", string[mediaType])
+			let part = try writer.createPart(headers)
+			try part.write(data)
+			return none
+		}
+
+		// The finished body. Fails when the closing boundary cannot be written.
+		def body() !byte[] {
+			try writer.close()
+			return buffer.bytes()
+		}
+
+		// The `Content-Type` the body needs.
+		def contentType() string {
+			return writer.formDataContentType()
+		}
+	}
+}

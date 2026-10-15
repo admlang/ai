@@ -1,0 +1,260 @@
+partial module adm.ai.gemini {
+	use (
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON)
+		std.ai.llm
+		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, tool)
+		std.ai.embeddings::(Embedder)
+	)
+
+	// An API key for the live test, which calls the real API with
+	// `ADM_TEST_GEMINI_MODEL` (default gemini-flash-lite-latest).
+	@env("ADM_TEST_GEMINI_KEY")
+	internal const liveKey string
+
+	@env("ADM_TEST_GEMINI_MODEL")
+	internal const liveModel string
+
+
+	// What the live tests fill from a sentence.
+	internal struct LiveBooking {
+		guest  string
+		nights int
+	}
+
+	internal type GeminiDesk {
+		// The weather of a city.
+		// @param city the city's name
+		@tool
+		def weather(city string) string {
+			return "{city}: 12 degrees and rain"
+		}
+	}
+
+	internal type Asked {
+		bodies  map<string, any>[]
+		paths   string[]
+		headers string[]
+	}
+
+	internal def chunk(data string) string {
+		return "data: {data}\r\n\r\n"
+	}
+
+	internal def geminiServer(asked Asked) !httptest.Server {
+		let mux = new http.ServeMux()
+		let codec = new JSON()
+		let server = new httptest.Server(mux)
+		let keep = def (ctx http.Context) !map<string, any> {
+			asked.paths.push(ctx.request.requestURI())
+			asked.headers.push(ctx.header("x-goog-api-key"))
+			let text = try ctx.text()
+			let body = new map<string, any>()
+			if text.len() > 0 && ctx.header("Content-Type").startsWith("application/json") {
+				let parsed = try codec.parse(text)
+				body = parsed when parsed is map<string, any>
+			}
+			asked.bodies.push(body)
+			return body
+		}
+		try mux.handle("POST /v1beta/models/\{action}", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			let action = ctx.request.param("action")
+			return ctx.text(429, "\{\"error\":\{\"code\":429,\"message\":\"Quota exceeded\",\"status\":\"RESOURCE_EXHAUSTED\"}}") when action.startsWith("quota")
+			return ctx.text("\{\"totalTokens\":31}") when action.endsWith(":countTokens")
+			return ctx.text("\{\"embeddings\":[\{\"values\":[0.5,1]},\{\"values\":[2,0.25]}]}") when action.endsWith(":batchEmbedContents")
+			let contents = body.get("contents")
+			let answered = false
+			if contents is any[] {
+				let last = contents[contents.len() - 1]
+				if last is map<string, any> {
+					let parts = last.get("parts")
+					if parts is any[] && parts.len() > 0 {
+						let first = parts[0]
+						answered = first is map<string, any> && !(first.get("functionResponse") is none)
+					}
+				}
+			}
+			if answered {
+				let out = chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\"Take a coat\",\"thoughtSignature\":\"T2\"}]}}]}")
+				out += chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\".\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":\{\"webSearchQueries\":[\"oslo weather\"],\"groundingChunks\":[\{\"web\":\{\"uri\":\"https://met.no\",\"title\":\"met.no\"}}],\"groundingSupports\":[\{\"segment\":\{\"startIndex\":0,\"endIndex\":11,\"text\":\"Take a coat\"},\"groundingChunkIndices\":[0]}]}}],\"usageMetadata\":\{\"promptTokenCount\":60,\"candidatesTokenCount\":4,\"cachedContentTokenCount\":50}}")
+				return ctx.text(out)
+			}
+			let out = chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\"Rain likely.\",\"thought\":true}]}}]}")
+			out += chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"functionCall\":\{\"name\":\"weather\",\"args\":\{\"city\":\"Oslo\"},\"id\":\"call_7\"},\"thoughtSignature\":\"SIG1\"}]}}]}")
+			out += chunk("\{\"candidates\":[\{\"content\":\{\"role\":\"model\",\"parts\":[\{\"text\":\"\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":\{\"promptTokenCount\":20,\"candidatesTokenCount\":10,\"thoughtsTokenCount\":30}}")
+			return ctx.text(out)
+		})
+		try mux.handle("GET /v1beta/models", def (ctx http.Context) !none {
+			return ctx.text("\{\"models\":[\{\"name\":\"models/gemini-embedding-001\",\"supportedGenerationMethods\":[\"embedContent\"]}]}") when ctx.request.query("pageToken", "") == "p2"
+			return ctx.text("\{\"models\":[\{\"name\":\"models/gemini-flash-latest\",\"displayName\":\"Gemini Flash Latest\",\"inputTokenLimit\":1048576,\"outputTokenLimit\":65536,\"supportedGenerationMethods\":[\"generateContent\",\"countTokens\"],\"thinking\":true}],\"nextPageToken\":\"p2\"}")
+		})
+		try mux.handle("GET /v1beta/models/\{id}", def (ctx http.Context) !none {
+			return ctx.text("\{\"name\":\"models/{ctx.request.param("id")}\",\"inputTokenLimit\":1000}")
+		})
+		try mux.handle("POST /upload/v1beta/files", def (ctx http.Context) !none {
+			try keep(ctx)
+			ctx.response.headers.set("X-Goog-Upload-URL", "http://{server.address().str()}/upload/session/1")
+			return ctx.text("")
+		})
+		try mux.handle("POST /upload/session/1", def (ctx http.Context) !none {
+			let data = try ctx.bytes()
+			asked.paths.push("upload {ctx.header("X-Goog-Upload-Command")} {data.len()}")
+			return ctx.text("\{\"file\":\{\"name\":\"files/abc\",\"uri\":\"https://generativelanguage.googleapis.com/v1beta/files/abc\",\"mimeType\":\"video/mp4\",\"sizeBytes\":\"5\",\"state\":\"PROCESSING\"}}")
+		})
+		try mux.handle("GET /v1beta/files/\{id}", def (ctx http.Context) !none {
+			return ctx.text("\{\"name\":\"files/{ctx.request.param("id")}\",\"uri\":\"u\",\"mimeType\":\"video/mp4\",\"state\":\"ACTIVE\"}")
+		})
+		try mux.handle("GET /v1beta/files", def (ctx http.Context) !none {
+			return ctx.text("\{\"files\":[\{\"name\":\"files/abc\",\"state\":\"ACTIVE\"}]}")
+		})
+		try mux.handle("DELETE /v1beta/files/\{id}", def (ctx http.Context) !none {
+			asked.paths.push("deleted {ctx.request.param("id")}")
+			return ctx.text("\{}")
+		})
+		try mux.handle("GET /v1beta/cachedContents", def (ctx http.Context) !none {
+			return ctx.text("\{\"cachedContents\":[\{\"name\":\"cachedContents/c1\",\"usageMetadata\":\{\"totalTokenCount\":4096}}]}")
+		})
+		try mux.handle("POST /v1beta/cachedContents", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"name\":\"cachedContents/c1\",\"model\":\"models/gemini-flash-latest\",\"expireTime\":\"2026-10-15T10:00:00Z\",\"usageMetadata\":\{\"totalTokenCount\":4096}}")
+		})
+		try mux.handle("PATCH /v1beta/cachedContents/\{id}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"name\":\"cachedContents/{ctx.request.param("id")}\",\"expireTime\":\"2026-10-15T12:00:00Z\"}")
+		})
+		try mux.handle("DELETE /v1beta/cachedContents/\{id}", def (ctx http.Context) !none {
+			return ctx.text("\{}")
+		})
+		try server.start()
+		return server
+	}
+
+	internal def problem(run def () !none) RemoteError {
+		let out = RemoteError{message: "no failure", kind: RemoteErrorKind.Protocol}
+		run() onerror (err error) {
+			out = err when err is RemoteError
+			recover none
+		}
+		return out
+	}
+
+	check "Gemini" {
+		@test()
+		def TestConversationWithToolsAndGrounding() !none {
+			let asked = new Asked()
+			let server = try geminiServer(asked)
+			let ai = new Client(model = "gemini-flash-latest", apiKey = "key-1", baseURL = "http://{server.address().str()}/v1beta")
+			ai.googleSearch = true
+			ai.safety = [SafetySetting{category: HarmCategory.DangerousContent, threshold: Threshold.OnlyHigh}]
+			let chat = ai.chat()
+			chat.system = "Be brief."
+			chat.reasoning = llm.Reasoning.Low
+			chat.limit = 300
+			chat.useTool(new GeminiDesk())
+			assert (try chat.say("Coat in Oslo?")) == "Take a coat."
+			let all = chat.messages()
+			assert all.len() == 5 && all[2].thinking == "Rain likely." && all[2].calls[0].id == "call_7"
+			let grounding = groundingOf(all[4])
+			assert grounding.queries.len() == 1 && grounding.sources[0].uri == "https://met.no" && grounding.supports[0].sources[0] == 0 && grounding.supports[0].end == 11
+			let used = chat.usage()
+			assert used.inputTokens == 80 && used.outputTokens == 44 && used.thinkingTokens == 30 && used.cachedTokens == 50
+
+			let first = asked.bodies[0]
+			assert asked.paths[0] == "/v1beta/models/gemini-flash-latest:streamGenerateContent?alt=sse" && asked.headers[0] == "key-1"
+			let config = first["generationConfig"]
+			fail "no config" unless config is map<string, any>
+			let thinking = config["thinkingConfig"]
+			fail "no thinking" unless thinking is map<string, any>
+			assert "{thinking["thinkingLevel"]}" == "low" && "{thinking["includeThoughts"]}" == "true" && "{config["maxOutputTokens"]}" == "300"
+			let tools = first["tools"]
+			fail "no tools" unless tools is any[]
+			assert tools.len() == 2
+			// The second request: the model's parts with their signatures,
+			// then the result naming its function.
+			let contents = asked.bodies[1]["contents"]
+			fail "no contents" unless contents is any[]
+			let sentText = string((new JSON()).encode(contents))
+			assert sentText.contains("\"thoughtSignature\":\"SIG1\"") && sentText.contains("\"functionResponse\":\{\"name\":\"weather\"") && sentText.contains("\"id\":\"call_7\"")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestEndpoints() !none {
+			let asked = new Asked()
+			let server = try geminiServer(asked)
+			let ai = new Client(model = "gemini-flash-latest", apiKey = "k", baseURL = "http://{server.address().str()}/v1beta")
+			let quota = problem(def () !none {
+				ai.httpClient.retry.attempts = 0
+				try ai.chat("quota").say("hi")
+				return none
+			})
+			assert quota.kind == RemoteErrorKind.RateLimited && quota.remoteCode == "RESOURCE_EXHAUSTED"
+
+			let embedder Embedder = ai.embedder(task = TaskType.RetrievalDocument, dimensions = 2)
+			let vectors = try embedder.embed(string["a", "b"])
+			assert vectors.len() == 2 && vectors[1][0] == float32(2)
+			let embedBody = string((new JSON()).encode(asked.bodies[asked.bodies.len() - 1]))
+			assert embedBody.contains("\"taskType\":\"RETRIEVAL_DOCUMENT\"") && embedBody.contains("\"outputDimensionality\":2")
+
+			let chat = ai.chat()
+			chat.system = "Be brief."
+			try chat.add(Message{role: Role.User, text: "Hello"})
+			assert (try ai.countTokens(chat, next = "And?")) == 31
+
+			let models = try ai.models()
+			assert models.len() == 2 && models[0].id == "gemini-flash-latest" && models[0].thinking && models[1].methods[0] == "embedContent"
+			assert (try ai.modelInfo("gemini-pro-latest")).contextWindow == 1000
+
+			let file = try ai.files.upload("hello".bytes(), "video/mp4", displayName = "clip")
+			assert file.name == "files/abc" && file.state == "PROCESSING" && file.size == 5 && asked.paths.indexOf("upload upload, finalize 5") >= 0
+			let ready = try ai.files.wait(file.name, pause = 1ms)
+			assert ready.state == "ACTIVE"
+			assert (try ai.files.list())[0].state == "ACTIVE"
+			try ai.files.delete("abc")
+			assert asked.paths.indexOf("deleted abc") >= 0
+			let reference = remote(file)
+			assert reference.id.endsWith("/files/abc") && reference.mediaType == "video/mp4"
+
+			let cache = try ai.caches.create("gemini-flash-latest", [Message{role: Role.User, text: "A long manual."}], system = "Answer from the manual.", ttl = 10min)
+			assert cache.name == "cachedContents/c1" && cache.tokens == 4096
+			let cacheBody = asked.bodies[asked.bodies.len() - 1]
+			assert "{cacheBody["ttl"]}" == "600s" && "{cacheBody["model"]}" == "models/gemini-flash-latest"
+			assert !((try ai.caches.extend(cache.name, 2h)).expires is none)
+			assert "{asked.bodies[asked.bodies.len() - 1]["ttl"]}" == "7200s"
+			assert (try ai.caches.list())[0].tokens == 4096
+			try ai.caches.delete(cache.name)
+			try server.close()
+			return none
+		}
+
+		// With ADM_TEST_GEMINI_KEY: a short answer, a tool round, embeddings
+		// and token counting from the real API.
+		@test()
+		def TestLiveApi() !none {
+			return none when liveKey.len() == 0
+			let ai = new Client(model = liveModel.len() > 0 ?? (liveModel, "gemini-flash-lite-latest"), apiKey = liveKey)
+			let chat = ai.chat()
+			chat.limit = 2000
+			let answer = try chat.say("What is 2 + 3? Reply with the number only.")
+			fail "answer: {answer}" unless answer.contains("5")
+			assert chat.usage().inputTokens > 0
+			let tools = ai.chat()
+			tools.limit = 2000
+			tools.useTool(new GeminiDesk())
+			let reply = try tools.say("What is the weather in Oslo? Use the tool.")
+			let all = tools.messages()
+			fail "no call: {reply}" unless all.len() >= 4 && all[1].calls.len() >= 1 && all[2].role == Role.Tool
+			let booking = LiveBooking{}
+			try ai.chat().fill(booking, "Extract the guest's name and the number of nights from this text: Ada Lovelace stays three nights.")
+			fail "filled {booking.guest} {booking.nights}" unless booking.guest.contains("Ada") && booking.nights == 3
+			let vectors = try ai.embedder(dimensions = 256).embed(string["a cat", "a dog"])
+			assert vectors.len() == 2 && vectors[0].len() == 256
+			assert (try ai.countTokens(tools)) > 0
+			return none
+		}
+	}
+}

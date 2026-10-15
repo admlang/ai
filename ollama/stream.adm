@@ -1,0 +1,157 @@
+partial module adm.ai.ollama {
+	use (
+		std.io
+		std.bytes
+		std.net.http
+		std.data.encoding::(JSON)
+		std.ai.llm::(ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, ToolCall)
+		adm.ai.ollama.wire::*
+	)
+
+	// The reply of /api/chat as it streams: one JSON object a line, each
+	// a piece of thinking, text or calls, the last one `done` with the
+	// counts. Implements `llm.ReplyStream`.
+	internal type ChatStream {
+		internal res     http.Response
+		internal lines   http.WireReader
+		internal pending ReplyEvent[]
+		internal ended   bool
+		internal calls   int
+
+		def new(res http.Response) {
+			self.res = res
+			lines = new http.WireReader(bodyOf(res))
+		}
+
+		// The next event; none after `Done`.
+		// Fails with RemoteError when the connection breaks, the server
+		// reports an error mid-reply, or a line is not its JSON.
+		def next() !?ReplyEvent {
+			for pending.len() == 0 {
+				return none when ended
+				let chunk = try readChunk(lines, res)
+				if chunk is none {
+					close()
+					fail RemoteError{message: "ollama: the reply ended before it was done", code: "protocol", kind: RemoteErrorKind.Protocol}
+				}
+				queue(chunk)
+			}
+			let event = pending[0]
+			pending.remove(0)
+			return event
+		}
+
+		// Stops reading the reply.
+		def close() {
+			ended = true
+			res.close() onerror recover none
+		}
+
+		internal def queue(chunk ChunkWire) {
+			let m = chunk.message
+			pending.push(ReplyEvent{kind: ReplyEventKind.Thinking, text: m.thinking}) when m.thinking.len() > 0
+			pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: m.content}) when m.content.len() > 0
+			for let (_, c) in m.toolCalls {
+				calls++
+				let id = c.id.len() > 0 ?? (c.id, "call_{calls}")
+				let arguments = c.fn.arguments is none ?? ("\{}", string((new JSON()).encode(c.fn.arguments)))
+				pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(id, c.fn.name, arguments)})
+			}
+			return unless chunk.done
+			let stop = chunk.doneReason == "length" ?? (StopReason.Limit, calls > 0 ?? (StopReason.Calls, StopReason.End))
+			pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: usageOf(chunk)})
+			close()
+		}
+	}
+
+	// The text /api/generate streams: `next` returns it piece by piece,
+	// `text` whole.
+	type Completion {
+		internal res   http.Response
+		internal lines http.WireReader
+		internal ended bool
+		internal used  Usage
+		internal stop  StopReason
+
+		def new(res http.Response) {
+			self.res = res
+			lines = new http.WireReader(bodyOf(res))
+		}
+
+		// The next piece of text; none at the end.
+		// Fails like ChatStream.next.
+		def next() !?string {
+			for {
+				return none when ended
+				let chunk = try readChunk(lines, res)
+				if chunk is none {
+					close()
+					fail RemoteError{message: "ollama: the reply ended before it was done", code: "protocol", kind: RemoteErrorKind.Protocol}
+				}
+				if chunk.done {
+					used = usageOf(chunk)
+					stop = chunk.doneReason == "length" ?? (StopReason.Limit, StopReason.End)
+					close()
+				}
+				return chunk.response when chunk.response.len() > 0
+			}
+		}
+
+		// The rest of the text at once.
+		// Fails like `next`.
+		def text() !string {
+			let out = ""
+			for {
+				let piece = try next()
+				break when piece is none
+				out = out + piece
+			}
+			return out
+		}
+
+		// The tokens counted, once the text has ended.
+		def usage() Usage {
+			return used
+		}
+
+		// Why the text ended: End or Limit.
+		def stopReason() StopReason {
+			return stop
+		}
+
+		// Stops reading the reply.
+		def close() {
+			ended = true
+			res.close() onerror recover none
+		}
+	}
+
+	// The next line of a streamed reply as a chunk; none at the end of the
+	// stream. Fails with RemoteError when the line reports an error or is
+	// not a chunk.
+	internal def readChunk(lines http.WireReader, res http.Response) !?ChunkWire {
+		for {
+			let line = lines.readLine() onerror (err error) {
+				fail RemoteError{message: "ollama: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+			}
+			return none when line is none
+			continue when line.trim().len() == 0
+			let chunk = new ChunkWire()
+			(new JSON()).decode(line, chunk) onerror (err error) {
+				fail RemoteError{message: "ollama: a line of the reply is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol, status: res.status}
+			}
+			fail RemoteError{message: "ollama: {chunk.error}", code: "server", kind: RemoteErrorKind.Server, status: res.status} when chunk.error.len() > 0
+			return chunk
+		}
+	}
+
+	// The body of a reply that has one (a streamed reply always does).
+	internal def bodyOf(res http.Response) io.Reader {
+		let body = res.body
+		return body is none ?? (new bytes.Buffer(), body)
+	}
+
+	internal def usageOf(chunk ChunkWire) Usage {
+		return Usage{inputTokens: chunk.promptEvalCount, outputTokens: chunk.evalCount, cachedTokens: chunk.promptEvalCachedCount}
+	}
+}

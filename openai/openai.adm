@@ -1,3 +1,286 @@
+// An OpenAI API client over std.net.http, for OpenAI and for the servers
+// that speak its API (OpenRouter, Groq, Mistral, DeepSeek, Together,
+// vLLM, LM Studio, Ollama). Its conversations are std.ai.llm's: `chat()`
+// gives a `llm.RemoteChat`, with tools, `@tool` methods, MCP tools,
+// pictures and documents as a local `llm.Session` takes them;
+// `embedder` gives a `std.ai.embeddings.Embedder`.
+//
+// ```
+// let ai = new openai.Client(model = "gpt-5-mini")    // OPENAI_API_KEY
+// let chat = ai.chat()
+// print(try chat.say("Name three primes."))
+// chat.model = "gpt-5"
+// print(try chat.say("And their sum?"))
+// ```
 partial module adm.ai.openai {
-	// OpenAI API over std.net.http: responses and chat completions with tools and streaming, embeddings, images, audio, files, batches; baseURL for compatible servers (OpenRouter, Groq, Mistral, DeepSeek, Together, vLLM, LM Studio)
+	use (
+		std.bytes
+		std.net.http
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON, Base64)
+		std.formats.image::(Image)
+		std.ai.llm::(RemoteChat, ChatRequest, ReplyStream, RemoteError, RemoteErrorKind, Reasoning, remoteErrorKind)
+	)
+
+	// OpenAI's address; `baseURL` replaces it for another server.
+	const openaiURL = "https://api.openai.com/v1"
+
+	// Which of OpenAI's two conversation APIs `chat()` speaks.
+	enum Api {
+		// The Responses API on OpenAI, Chat Completions on other servers.
+		Auto,
+		// /responses: reasoning items carried between turns, reasoning
+		// summaries streamed, no sound in.
+		Responses,
+		// /chat/completions: what every compatible server speaks; sound in.
+		ChatCompletions,
+	}
+
+	// How long a reasoning model thinks, beyond the conversation's
+	// `reasoning` levels (which map to Low, Medium and High).
+	enum Effort {
+		None    = "none",
+		Minimal = "minimal",
+		Low     = "low",
+		Medium  = "medium",
+		High    = "high",
+		XHigh   = "xhigh",
+		Max     = "max",
+	}
+
+	// How long the answers of GPT-5 models are.
+	enum Verbosity {
+		Low    = "low",
+		Medium = "medium",
+		High   = "high",
+	}
+
+	// The processing a request asks for, and pays for.
+	enum ServiceTier {
+		Auto     = "auto",
+		Default  = "default",
+		Flex     = "flex",
+		Priority = "priority",
+	}
+
+	// A connection to OpenAI or a compatible server: the key, the model new
+	// conversations use, and settings every request carries. It holds no
+	// connection of its own (std.net.http keeps them), so any number of
+	// tasks may share it.
+	//
+	// Requests fail with `llm.RemoteError`: Auth for a missing or wrong
+	// key, RateLimited when the account's limits or quota are reached (the
+	// client retries 429s first), BadRequest for a request the server
+	// refuses (a prompt longer than the context included), NotFound,
+	// ContentFiltered for prompts the moderation refuses, Overloaded and
+	// Server for the server's failures, Transport when it cannot be
+	// reached.
+	partial type Client {
+		// The model `chat()` uses ("gpt-5-mini"); a conversation keeps its
+		// own copy, which can change between replies.
+		model             string
+		apiKey            ?Secret<string>
+		// The API's base: `https://api.openai.com/v1`, or a compatible
+		// server's (`https://openrouter.ai/api/v1`, `http://localhost:11434/v1`).
+		baseURL           string
+		api               Api             = Api.Auto
+		// Sent as `OpenAI-Organization` and `OpenAI-Project` when set.
+		organization      string          = ""
+		project           string          = ""
+		// Overrides the conversation's `reasoning` with a level it cannot
+		// name (None, Minimal, XHigh, Max).
+		effort            ?Effort         = none
+		// Streams a summary of the reasoning as thinking text (Responses).
+		summarize         bool            = true
+		verbosity         ?Verbosity      = none
+		serviceTier       ?ServiceTier    = none
+		// Lets the model ask for several calls in one reply.
+		parallelToolCalls bool            = true
+		// A stable id of the end user, for OpenAI's abuse detection.
+		safetyIdentifier  string          = ""
+		// Groups requests that share a long prefix, for the prompt cache.
+		promptCacheKey    string          = ""
+		// The HTTP client requests go through: headers, timeouts, a
+		// transport. Rate-limited and busy replies are sent again (`retry`).
+		httpClient        http.Client
+
+		// A client of OpenAI with `apiKey` (else `OPENAI_API_KEY`), or of the
+		// server at `baseURL` (else `OPENAI_BASE_URL`).
+		def new(model string = "", apiKey ?Secret<string> = none, baseURL string = "") {
+			self.model = model
+			let key = Runtime.getEnv("OPENAI_API_KEY")
+			self.apiKey = apiKey is none ?? (key is none ?? (none, key), apiKey)
+			let url = Runtime.getEnv("OPENAI_BASE_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, url is none ?? (openaiURL, url))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.retry = http.RetryPolicy{attempts: 3, statuses: [429, 500, 502, 503, 504], allMethods: true}
+		}
+
+		// A conversation with `model` (none: the client's). It is a
+		// `llm.Chat`.
+		def chat(model string = "") RemoteChat {
+			return new RemoteChat(self, model.len() > 0 ?? (model, self.model))
+		}
+
+		// Sends `request` to /responses or /chat/completions (see `api`) and
+		// returns the reply as it streams: what `RemoteChat` calls.
+		// Implements `llm.ChatProvider`.
+		// Fails with RemoteError when the server refuses the request, or a
+		// message carries sound for the Responses API.
+		def reply(request ChatRequest) !ReplyStream {
+			if usesResponses() {
+				let res = try post(self, "/responses", try responsesBody(self, request))
+				return new ResponsesStream(res)
+			}
+			let res = try post(self, "/chat/completions", try completionsBody(self, request))
+			return new CompletionsStream(res)
+		}
+
+		// Whether `chat()` speaks the Responses API.
+		def usesResponses() bool {
+			return api == Api.Responses || (api == Api.Auto && baseURL == openaiURL)
+		}
+
+		// The vectors of an embedding model ("text-embedding-3-small");
+		// `dimensions` shortens them where the model allows (0 for its own
+		// size). It is a `std.ai.embeddings.Embedder`.
+		def embedder(model string, dimensions int = 0) Embeddings {
+			return new Embeddings(self, model, dimensions)
+		}
+	}
+
+	// OpenAI's `reasoning.effort` for a request: the client's override, else
+	// the conversation's level; none for the model's default.
+	internal def effortOf(client Client, request ChatRequest) ?string {
+		let forced = client.effort
+		return forced.value unless forced is none
+		let thinking = request.thinking
+		return "none" when thinking is bool && !thinking
+		let level = request.reasoning
+		return none when level is none
+		match level {
+			case Reasoning.Low:
+				return "low"
+			case Reasoning.Medium:
+				return "medium"
+			case Reasoning.High:
+				return "high"
+		}
+		return none
+	}
+
+	// A JSON request to the API. Fails with the RemoteError the reply
+	// describes when it is not a success.
+	internal def post(client Client, path string, body map<string, any>) !http.Response {
+		let req = try request(client, http.Method.POST, path)
+		req.replaceBody((new JSON()).encode(body))
+		req.headers.set("Content-Type", "application/json")
+		return try sent(client, req)
+	}
+
+	// A request with a multipart form body (uploads).
+	internal def postForm(client Client, path string, form Form) !http.Response {
+		let req = try request(client, http.Method.POST, path)
+		req.replaceBody(try form.body())
+		req.headers.set("Content-Type", form.contentType())
+		return try sent(client, req)
+	}
+
+	internal def request(client Client, method http.Method, path string) !http.Request {
+		let req = try client.httpClient.request(method, client.baseURL + path)
+		let key = client.apiKey
+		req.bearerToken(key.reveal()) unless key is none
+		req.headers.set("OpenAI-Organization", client.organization) when client.organization.len() > 0
+		req.headers.set("OpenAI-Project", client.project) when client.project.len() > 0
+		return req
+	}
+
+	internal def sent(client Client, req http.Request) !http.Response {
+		let res = client.httpClient.do(req) onerror (err error) {
+			fail RemoteError{message: "openai: {client.baseURL}: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+		}
+		try checked(res)
+		return res
+	}
+
+	// Fails with the RemoteError a reply's status and body describe when
+	// it is not a success: `{"error": {"message", "type", "code"}}`.
+	internal def checked(res http.Response) !none {
+		return none when res.ok()
+		let text = res.text() onerror recover ""
+		res.close() onerror recover none
+		let (message, code, errorType) = errorParts(text)
+		let kind = remoteErrorKind(res.status)
+		kind = RemoteErrorKind.ContentFiltered when code == "content_filter" || code == "content_policy_violation" || errorType == "content_policy_violation"
+		kind = RemoteErrorKind.RateLimited when code == "insufficient_quota"
+		let said = message.len() > 0 ?? (message, text.len() > 0 ?? (text.trim(), res.reason))
+		fail RemoteError{message: "openai: {said}", code: kind.value, kind: kind, status: res.status, remoteCode: code.len() > 0 ?? (code, errorType), requestId: res.header("x-request-id"), retryAfter: res.retryAfter()}
+	}
+
+	// The message, code and type of an error body; empty when it has none.
+	internal def errorParts(text string) (string, string, string) {
+		let parsed = (new JSON()).parse(text) onerror recover none
+		return ("", "", "") unless parsed is map<string, any>
+		let inner = parsed.get("error")
+		let error = inner is map<string, any> ?? (inner, parsed)
+		return (textAt(error, "message"), textAt(error, "code"), textAt(error, "type"))
+	}
+
+	// The text of `key` in an object; "" when absent or not a string or
+	// number.
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return "" when v is none
+		match v {
+			case string:
+				return v
+			case int:
+				return "{v}"
+			case float:
+				return "{v}"
+			case bool:
+				return v ?? ("true", "false")
+			default:
+				return ""
+		}
+	}
+
+	internal def intAt(object map<string, any>, key string) int {
+		let v = object.get(key)
+		return v when v is int
+		return int(v) when v is float
+		return 0
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
+
+	internal def listAt(object map<string, any>, key string) any[] {
+		let v = object.get(key)
+		return v is any[] ?? (v, any[])
+	}
+
+	// A whole reply's JSON object.
+	internal def objectOf(res http.Response) !map<string, any> {
+		let text = try res.text()
+		let parsed = (new JSON()).parse(text) onerror (err error) {
+			fail RemoteError{message: "openai: the reply is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol, status: res.status}
+		}
+		fail RemoteError{message: "openai: the reply is not a JSON object", code: "protocol", kind: RemoteErrorKind.Protocol, status: res.status} unless parsed is map<string, any>
+		return parsed
+	}
+
+	// A picture as a `data:` URL of PNG bytes.
+	internal def imageURL(picture Image) !string {
+		return "data:image/png;base64," + (new Base64()).encode(try pngOf(picture))
+	}
+
+	internal def pngOf(picture Image) !byte[] {
+		let buffer = new bytes.Buffer()
+		try picture.write(buffer, ".png")
+		return buffer.bytes()
+	}
 }

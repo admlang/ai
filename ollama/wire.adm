@@ -1,0 +1,109 @@
+// The JSON shapes of Ollama's replies.
+internal partial module adm.ai.ollama.wire {
+	use std.data.encoding::(json)
+
+	// One line of a streamed /api/chat or /api/generate reply.
+	struct ChunkWire {
+		model string
+		message MessageWire
+		// /api/generate's piece of text.
+		response string
+		done bool
+		@json("done_reason")
+		doneReason string
+		@json("prompt_eval_count")
+		promptEvalCount int
+		@json("prompt_eval_cached_count")
+		promptEvalCachedCount int
+		@json("eval_count")
+		evalCount int
+		// Set instead of the rest when the server fails mid-reply.
+		error string
+	}
+
+	struct MessageWire {
+		role string
+		content string
+		thinking string
+		@json("tool_calls")
+		toolCalls CallWire[]
+	}
+
+	struct CallWire {
+		id string
+		@json("function")
+		fn FunctionWire
+	}
+
+	struct FunctionWire {
+		name      string
+		arguments any
+	}
+
+	struct ErrorWire {
+		error string
+	}
+
+	struct VersionWire {
+		version string
+	}
+
+	struct DetailsWire {
+		@json("parent_model")
+		parentModel string
+		format string
+		family string
+		families string[]
+		@json("parameter_size")
+		parameterSize string
+		@json("quantization_level")
+		quantizationLevel string
+	}
+
+	// A model of /api/tags or /api/ps.
+	struct ModelWire {
+		name string
+		model string
+		size int
+		digest string
+		@json("modified_at")
+		modifiedAt string
+		@json("expires_at")
+		expiresAt string
+		@json("size_vram")
+		sizeVram int
+		@json("context_length")
+		contextLength int
+		details DetailsWire
+	}
+
+	struct ModelsWire {
+		models ModelWire[]
+	}
+
+	struct ShowWire {
+		modelfile string
+		parameters string
+		template string
+		system string
+		license string
+		details DetailsWire
+		@json("model_info")
+		modelInfo any
+		capabilities string[]
+		@json("modified_at")
+		modifiedAt string
+	}
+
+	struct ProgressWire {
+		status    string
+		digest    string
+		total     int
+		completed int
+		error     string
+	}
+
+	struct EmbedWire {
+		embeddings float32[][]
+	}
+}

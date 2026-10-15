@@ -1,0 +1,351 @@
+partial module adm.ai.anthropic {
+	use (
+		std.os
+		std.time
+		std.bytes
+		std.net.http
+		std.net.url
+		std.net.multipart
+		std.data.encoding::(JSON)
+		std.ai.llm::(RemoteChat, ChatRequest, Usage, StopReason, RemoteError, RemoteErrorKind, Message, Role, ToolCall)
+	)
+
+	// A model the API offers.
+	struct ModelInfo {
+		id            string
+		// "Claude Opus 5.5".
+		name          string
+		created       ?time.Time
+		// Tokens of prompt it reads, and of reply it writes at most; 0 when
+		// the API does not say.
+		contextWindow int
+		maxOutput     int
+	}
+
+	// A file uploaded to the API, to name in messages.
+	struct FileInfo {
+		id           string
+		filename     string
+		mediaType    string
+		size         int
+		created      ?time.Time
+		// Whether `files.content` can read it back (files the API made).
+		downloadable bool
+	}
+
+	// One request of a batch: its own id and the conversation to answer.
+	struct BatchRequest {
+		id      string
+		request ChatRequest
+	}
+
+	// How many requests of a batch are in each state.
+	struct BatchCounts {
+		processing int
+		succeeded  int
+		errored    int
+		canceled   int
+		expired    int
+	}
+
+	// A message batch: requests answered within a day at half the price.
+	struct Batch {
+		id       string
+		// "in_progress", "canceling", "ended".
+		status   string
+		requests BatchCounts
+		created  ?time.Time
+		ended    ?time.Time
+		expires  ?time.Time
+	}
+
+	// How one request of a batch ended.
+	enum BatchOutcome {
+		Succeeded,
+		Errored,
+		Canceled,
+		Expired,
+	}
+
+	// The answer to one request of a batch.
+	struct BatchResult {
+		id      string
+		outcome BatchOutcome
+		// The reply, when it succeeded: text, thinking, calls, and its
+		// blocks in `providerState` to go on with the conversation.
+		message Message
+		usage   Usage
+		stop    StopReason
+		// Why it failed, when it errored.
+		error   string
+	}
+
+	partial type Client {
+		// The tokens `chat`'s conversation takes as a prompt, with `next` as
+		// one more user message when given (/messages/count_tokens).
+		// Fails with RemoteError when the API refuses the conversation.
+		def countTokens(chat RemoteChat, next string = "") !int {
+			let messages Message[]
+			for let (k, m) in chat.messages() {
+				continue when k == 0 && m.role == Role.System && chat.system.len() > 0
+				messages.push(m)
+			}
+			messages.push(Message{role: Role.User, text: next}) when next.len() > 0
+			let request = ChatRequest{model: chat.model, system: chat.system, messages: messages, tools: chat.tools, limit: chat.limit, thinking: chat.thinking, reasoning: chat.reasoning}
+			let body = try messagesBody(self, request)
+			body.delete("max_tokens")
+			body.delete("fallbacks")
+			body.delete("cache_control")
+			let reply = try objectOf(try post(self, "/messages/count_tokens", body, betas))
+			return intAt(reply, "input_tokens")
+		}
+
+		// The models the API offers, newest first.
+		// Fails with RemoteError when the API cannot be asked.
+		def models() !ModelInfo[] {
+			let out ModelInfo[]
+			for let (_, item) in try listAll(self, "/models") {
+				out.push(modelOf(item))
+			}
+			return out
+		}
+
+		// The model `id` (an alias like "claude-opus-5-5" names the model it
+		// points to).
+		// Fails with RemoteError NotFound when there is none.
+		def modelInfo(id string) !ModelInfo {
+			return modelOf(try objectOf(try fetch(self, "/models/" + url.pathEscape(id))))
+		}
+
+		// Files uploaded to the API: upload, list, get, delete, content.
+		files Files {
+			def get() Files {
+				return new Files(self)
+			}
+		}
+
+		// Message batches: create, get, list, cancel, delete, results.
+		batches Batches {
+			def get() Batches {
+				return new Batches(self)
+			}
+		}
+	}
+
+	// The file endpoints of a client (`ai.files`).
+	type Files {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Uploads `data` as `filename` of `mediaType` ("application/pdf",
+		// "image/png", "text/plain").
+		// Fails with RemoteError when the API refuses the file.
+		def upload(data byte[], filename string, mediaType string) !FileInfo {
+			let buffer = new bytes.Buffer()
+			let form = new multipart.Writer(buffer)
+			let headers = new map<string, string[]>()
+			headers.set("Content-Disposition", string["form-data; name=\"file\"; filename=\"{filename}\""])
+			headers.set("Content-Type", string[mediaType])
+			let part = try form.createPart(headers)
+			try part.write(data)
+			try form.close()
+			let req = try request(client, http.Method.POST, "/files")
+			req.replaceBody(buffer.bytes())
+			req.headers.set("Content-Type", form.formDataContentType())
+			return fileOf(try objectOf(try sent(client, req)))
+		}
+
+		// Uploads the file at `path`, of `mediaType`.
+		// Fails when the file cannot be read, or like the other `upload`.
+		def upload(path string, mediaType string) !FileInfo {
+			return try upload(try os.readFile(path), os.base(path), mediaType)
+		}
+
+		// Every file uploaded.
+		// Fails with RemoteError when the API cannot be asked.
+		def list() !FileInfo[] {
+			let out FileInfo[]
+			for let (_, item) in try listAll(client, "/files") {
+				out.push(fileOf(item))
+			}
+			return out
+		}
+
+		// The file `id`.
+		// Fails with RemoteError NotFound when there is none.
+		def get(id string) !FileInfo {
+			return fileOf(try objectOf(try fetch(client, "/files/" + url.pathEscape(id))))
+		}
+
+		// The bytes of the file `id`; only files the API made can be read.
+		// Fails like `get`, and with BadRequest for a file uploaded.
+		def content(id string) !byte[] {
+			return try (try fetch(client, "/files/{url.pathEscape(id)}/content")).bytes()
+		}
+
+		// Deletes the file `id`.
+		// Fails like `get`.
+		def delete(id string) !none {
+			try objectOf(try sent(client, try request(client, http.Method.DELETE, "/files/" + url.pathEscape(id))))
+			return none
+		}
+	}
+
+	// The message batch endpoints of a client (`ai.batches`).
+	type Batches {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Sends `requests` to be answered within 24 hours.
+		// Fails with RemoteError when the API refuses the batch, or like
+		// `reply` for a request it cannot take.
+		def create(requests BatchRequest[]) !Batch {
+			let list any[] = []
+			for let (_, r) in requests {
+				let params = try messagesBody(client, r.request)
+				params.delete("fallbacks")
+				list.push(map<string, any>{"custom_id": r.id, "params": params})
+			}
+			return batchOf(try objectOf(try post(client, "/messages/batches", map<string, any>{"requests": list}, client.betas)))
+		}
+
+		// The batch `id`, as it is now.
+		// Fails with RemoteError NotFound when there is none.
+		def get(id string) !Batch {
+			return batchOf(try objectOf(try fetch(client, "/messages/batches/" + url.pathEscape(id))))
+		}
+
+		// Every batch of the workspace.
+		// Fails with RemoteError when the API cannot be asked.
+		def list() !Batch[] {
+			let out Batch[]
+			for let (_, item) in try listAll(client, "/messages/batches") {
+				out.push(batchOf(item))
+			}
+			return out
+		}
+
+		// Stops the batch `id`; the requests answered stay answered.
+		// Fails like `get`.
+		def cancel(id string) !Batch {
+			return batchOf(try objectOf(try post(client, "/messages/batches/{url.pathEscape(id)}/cancel", new map<string, any>())))
+		}
+
+		// Deletes the ended batch `id` and its results.
+		// Fails like `get`, and when the batch has not ended.
+		def delete(id string) !none {
+			try objectOf(try sent(client, try request(client, http.Method.DELETE, "/messages/batches/" + url.pathEscape(id))))
+			return none
+		}
+
+		// The answers of the ended batch `id`, in no particular order: key
+		// them by `id`.
+		// Fails like `get`, and when the batch has not ended.
+		def results(id string) !BatchResult[] {
+			let text = string(try (try fetch(client, "/messages/batches/{url.pathEscape(id)}/results")).bytes())
+			let out BatchResult[]
+			let codec = new JSON()
+			for let (_, line) in text.split("\n") {
+				continue when line.trim().len() == 0
+				let parsed = codec.parse(line) onerror (err error) {
+					fail RemoteError{message: "anthropic: a result line is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+				}
+				continue unless parsed is map<string, any>
+				out.push(resultOf(parsed))
+			}
+			return out
+		}
+	}
+
+	internal def fetch(client Client, path string) !http.Response {
+		return try sent(client, try request(client, http.Method.GET, path))
+	}
+
+	// Every item of a listing, following its pages (`has_more`,
+	// `last_id`).
+	internal def listAll(client Client, path string) !map<string, any>[] {
+		let out map<string, any>[]
+		let after = ""
+		for {
+			let page = try objectOf(try fetch(client, after.len() > 0 ?? ("{path}?limit=100&after_id={url.queryEscape(after)}", "{path}?limit=100")))
+			for let (_, item) in listAt(page, "data") {
+				out.push(item) when item is map<string, any>
+			}
+			let more = page.get("has_more")
+			after = textAt(page, "last_id")
+			break unless more is bool && more && after.len() > 0
+		}
+		return out
+	}
+
+	// An RFC 3339 time as the API writes it; none when absent or not one.
+	internal def timeAt(object map<string, any>, key string) ?time.Time {
+		let text = textAt(object, key)
+		return none when text.len() == 0
+		let bad = false
+		let at = time.parse(text) onerror (err error) {
+			bad = true
+			recover time.now()
+		}
+		return bad ?? (none, at)
+	}
+
+	internal def modelOf(item map<string, any>) ModelInfo {
+		return ModelInfo{id: textAt(item, "id"), name: textAt(item, "display_name"), created: timeAt(item, "created_at"), contextWindow: intAt(item, "max_input_tokens"), maxOutput: intAt(item, "max_tokens")}
+	}
+
+	internal def fileOf(item map<string, any>) FileInfo {
+		let downloadable = item.get("downloadable")
+		return FileInfo{id: textAt(item, "id"), filename: textAt(item, "filename"), mediaType: textAt(item, "mime_type"), size: intAt(item, "size_bytes"), created: timeAt(item, "created_at"), downloadable: downloadable is bool && downloadable}
+	}
+
+	internal def batchOf(item map<string, any>) Batch {
+		let counts = objectAt(item, "request_counts")
+		return Batch{id: textAt(item, "id"), status: textAt(item, "processing_status"), requests: BatchCounts{processing: intAt(counts, "processing"), succeeded: intAt(counts, "succeeded"), errored: intAt(counts, "errored"), canceled: intAt(counts, "canceled"), expired: intAt(counts, "expired")}, created: timeAt(item, "created_at"), ended: timeAt(item, "ended_at"), expires: timeAt(item, "expires_at")}
+	}
+
+	// One line of a batch's results.
+	internal def resultOf(line map<string, any>) BatchResult {
+		let result = objectAt(line, "result")
+		let out = BatchResult{id: textAt(line, "custom_id"), message: Message{role: Role.Assistant}}
+		match textAt(result, "type") {
+			case "succeeded":
+				out.outcome = BatchOutcome.Succeeded
+				let message = objectAt(result, "message")
+				let blocks = listAt(message, "content")
+				for let (_, block) in blocks {
+					continue unless block is map<string, any>
+					match textAt(block, "type") {
+						case "text":
+							out.message.text += textAt(block, "text")
+						case "thinking":
+							out.message.thinking += textAt(block, "thinking")
+						case "tool_use":
+							let input = block.get("input")
+							let arguments = input is none ?? ("\{}", string((new JSON()).encode(input)))
+							out.message.calls.push(new ToolCall(textAt(block, "id"), textAt(block, "name"), arguments))
+						default:
+					}
+				}
+				out.message.providerState = blocksState + string((new JSON()).encode(blocks))
+				let usage = objectAt(message, "usage")
+				out.usage = Usage{inputTokens: intAt(usage, "input_tokens") + intAt(usage, "cache_creation_input_tokens") + intAt(usage, "cache_read_input_tokens"), outputTokens: intAt(usage, "output_tokens"), cachedTokens: intAt(usage, "cache_read_input_tokens"), cacheWriteTokens: intAt(usage, "cache_creation_input_tokens")}
+				out.stop = stopOf(textAt(message, "stop_reason"))
+			case "errored":
+				out.outcome = BatchOutcome.Errored
+				let error = objectAt(objectAt(result, "error"), "error")
+				out.error = textAt(error, "message").len() > 0 ?? (textAt(error, "message"), textAt(objectAt(result, "error"), "message"))
+			case "canceled":
+				out.outcome = BatchOutcome.Canceled
+			default:
+				out.outcome = BatchOutcome.Expired
+		}
+		return out
+	}
+}

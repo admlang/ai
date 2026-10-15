@@ -1,0 +1,160 @@
+partial module adm.ai.anthropic {
+	use (
+		std.net.http
+		std.data.encoding::(JSON)
+		std.ai.llm::(ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, ToolCall)
+	)
+
+	// The reply of /messages as it streams (server-sent events). Each
+	// content block is rebuilt from its deltas: the whole list goes into
+	// the reply's `Message.providerState` and back to the API unchanged, as
+	// signed thinking must. Implements `llm.ReplyStream`.
+	internal type MessageStream {
+		internal res     http.Response
+		internal events  http.EventReader
+		internal pending ReplyEvent[]
+		internal ended   bool
+		internal blocks  map<string, any>[]
+		internal inputs  map<int, string>
+		internal used    Usage
+		internal reason  string
+
+		def new(res http.Response) {
+			self.res = res
+			events = new http.EventReader(res.body)
+			inputs = new map<int, string>()
+		}
+
+		// The next event; none after `Done`.
+		// Fails with RemoteError when the connection breaks or the API
+		// reports an error mid-reply (an overload among them).
+		def next() !?ReplyEvent {
+			for pending.len() == 0 {
+				return none when ended
+				let event = events.next() onerror (err error) {
+					close()
+					fail RemoteError{message: "anthropic: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+				}
+				if event is none {
+					close()
+					fail RemoteError{message: "anthropic: the reply ended before message_stop", code: "protocol", kind: RemoteErrorKind.Protocol}
+				}
+				try take(event.data)
+			}
+			let event = pending[0]
+			pending.remove(0)
+			return event
+		}
+
+		// Stops reading the reply.
+		def close() {
+			ended = true
+			res.close() onerror recover none
+		}
+
+		internal def take(data string) !none {
+			let parsed = (new JSON()).parse(data) onerror (err error) {
+				close()
+				fail RemoteError{message: "anthropic: an event is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+			}
+			return none unless parsed is map<string, any>
+			match textAt(parsed, "type") {
+				case "message_start":
+					count(objectAt(objectAt(parsed, "message"), "usage"))
+				case "content_block_start":
+					let at = intAt(parsed, "index")
+					for blocks.len() <= at {
+						blocks.push(new map<string, any>())
+					}
+					blocks[at] = objectAt(parsed, "content_block")
+				case "content_block_delta":
+					try delta(intAt(parsed, "index"), objectAt(parsed, "delta"))
+				case "content_block_stop":
+					finishBlock(intAt(parsed, "index"))
+				case "message_delta":
+					let said = textAt(objectAt(parsed, "delta"), "stop_reason")
+					reason = said when said.len() > 0
+					count(objectAt(parsed, "usage"))
+				case "message_stop":
+					let state = blocksState + string((new JSON()).encode(blocks))
+					pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stopOf(reason), usage: used, state: state})
+					close()
+				case "error":
+					close()
+					fail streamError(objectAt(parsed, "error"))
+				default:
+			}
+			return none
+		}
+
+		internal def delta(at int, change map<string, any>) !none {
+			return none unless at >= 0 && at < blocks.len()
+			let block = blocks[at]
+			match textAt(change, "type") {
+				case "text_delta":
+					let piece = textAt(change, "text")
+					block.set("text", textAt(block, "text") + piece)
+					pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: piece}) when piece.len() > 0
+				case "thinking_delta":
+					let piece = textAt(change, "thinking")
+					block.set("thinking", textAt(block, "thinking") + piece)
+					pending.push(ReplyEvent{kind: ReplyEventKind.Thinking, text: piece}) when piece.len() > 0
+				case "signature_delta":
+					block.set("signature", textAt(block, "signature") + textAt(change, "signature"))
+				case "input_json_delta":
+					let held = inputs.get(at)
+					inputs.set(at, (held is none ?? ("", held)) + textAt(change, "partial_json"))
+				case "citations_delta":
+					let list = listAt(block, "citations")
+					let citation = change.get("citation")
+					list.push(citation) unless citation is none
+					block.set("citations", list)
+				default:
+			}
+			return none
+		}
+
+		// A finished tool_use block gets its input; the call is reported.
+		internal def finishBlock(at int) {
+			return unless at >= 0 && at < blocks.len()
+			let block = blocks[at]
+			return unless textAt(block, "type") == "tool_use"
+			let held = inputs.get(at)
+			let text = held is none ?? ("", held)
+			let arguments = text.trim().len() == 0 ?? ("\{}", text)
+			let input = (new JSON()).parse(arguments) onerror recover none
+			block.set("input", input is none ?? (new map<string, any>(), input))
+			pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(textAt(block, "id"), textAt(block, "name"), arguments)})
+		}
+
+		// Adds the counts of a message_start or message_delta usage: the
+		// prompt's (uncached, written to and read from the cache) and the
+		// reply's so far.
+		internal def count(usage map<string, any>) {
+			let input = intAt(usage, "input_tokens") + intAt(usage, "cache_creation_input_tokens") + intAt(usage, "cache_read_input_tokens")
+			used.inputTokens = input when input > 0
+			let written = intAt(usage, "cache_creation_input_tokens")
+			used.cacheWriteTokens = written when written > 0
+			let read = intAt(usage, "cache_read_input_tokens")
+			used.cachedTokens = read when read > 0
+			let output = intAt(usage, "output_tokens")
+			used.outputTokens = output when output > 0
+		}
+	}
+
+	// The stop reason of the API as a `StopReason`.
+	internal def stopOf(reason string) StopReason {
+		match reason {
+			case "max_tokens", "model_context_window_exceeded":
+				return StopReason.Limit
+			case "stop_sequence":
+				return StopReason.Stop
+			case "tool_use":
+				return StopReason.Calls
+			case "refusal":
+				return StopReason.Filtered
+			default:
+				return StopReason.End
+		}
+	}
+}

@@ -1,0 +1,327 @@
+partial module adm.ai.ollama {
+	use (
+		std.os
+		std.time
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON)
+		std.ai.llm
+		std.ai.llm::(Role, RemoteError, RemoteErrorKind, StopReason, tool)
+		std.ai.embeddings::(Embedder)
+		std.formats.audio::(Audio)
+	)
+
+	// A running Ollama server (`host:port`) the live tests call.
+	@env("ADM_TEST_OLLAMA")
+	internal const liveServer string
+
+
+	// What the live tests fill from a sentence.
+	internal struct LiveBooking {
+		guest  string
+		nights int
+	}
+
+	// Tools the conversations offer.
+	internal type OllamaDesk {
+		// The weather of a city.
+		// @param city the city's name
+		@tool
+		def weather(city string) string {
+			return "{city}: 12 degrees and rain"
+		}
+	}
+
+	// What the loopback server was sent.
+	internal type Heard {
+		bodies map<string, any>[]
+		paths  string[]
+		auth   string[]
+	}
+
+	// A server that answers as Ollama does, keeping what it was sent.
+	internal def ollamaServer(heard Heard) !httptest.Server {
+		let mux = new http.ServeMux()
+		let codec = new JSON()
+		let keep = def (ctx http.Context) !map<string, any> {
+			let text = try ctx.text()
+			let body = new map<string, any>()
+			if text.len() > 0 {
+				let parsed = try codec.parse(text)
+				body = parsed when parsed is map<string, any>
+			}
+			heard.bodies.push(body)
+			heard.paths.push(ctx.request.path())
+			heard.auth.push(ctx.header("Authorization"))
+			return body
+		}
+		try mux.handle("POST /api/chat", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text(404, "\{\"error\":\"model 'missing' not found\"}") when "{body["model"]}" == "missing"
+			let messages = body["messages"]
+			let answered = false
+			if messages is any[] {
+				for let (_, m) in messages {
+					answered = answered || (m is map<string, any> && "{m["role"]}" == "tool")
+				}
+			}
+			return ctx.text("\{\"message\":\{\"role\":\"assistant\",\"thinking\":\"It rains.\"},\"done\":false}\n\{\"message\":\{\"role\":\"assistant\",\"content\":\"Take a coat\"},\"done\":false}\n\{\"message\":\{\"role\":\"assistant\",\"content\":\".\"},\"done\":false}\n\{\"message\":\{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":30,\"prompt_eval_cached_count\":20,\"eval_count\":5}\n") when answered
+			return ctx.text("\{\"message\":\{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[\{\"id\":\"call_1\",\"function\":\{\"index\":0,\"name\":\"weather\",\"arguments\":\{\"city\":\"Oslo\"}}}]},\"done\":false}\n\{\"message\":\{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":10,\"eval_count\":7}\n")
+		})
+		try mux.handle("POST /api/generate", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"response\":\"Once \",\"done\":false}\n\{\"response\":\"upon\",\"done\":false}\n\{\"response\":\"\",\"done\":true,\"done_reason\":\"length\",\"prompt_eval_count\":3,\"eval_count\":2}\n")
+		})
+		try mux.handle("POST /api/embed", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			let input = body["input"]
+			let count = input is any[] ?? (input.len(), 1)
+			let rows string[]
+			for let k = 0; k < count; k++ {
+				rows.push("[{k}.5,1,0]")
+			}
+			return ctx.text("\{\"model\":\"tiny\",\"embeddings\":[{rows.join(",")}]}")
+		})
+		try mux.handle("GET /api/tags", def (ctx http.Context) !none {
+			return ctx.text("\{\"models\":[\{\"name\":\"qwen3:4b\",\"model\":\"qwen3:4b\",\"modified_at\":\"2026-10-01T10:20:30.123456789+03:00\",\"size\":2500000000,\"digest\":\"abc\",\"details\":\{\"format\":\"gguf\",\"family\":\"qwen3\",\"families\":[\"qwen3\"],\"parameter_size\":\"4.0B\",\"quantization_level\":\"Q4_K_M\"}}]}")
+		})
+		try mux.handle("GET /api/ps", def (ctx http.Context) !none {
+			return ctx.text("\{\"models\":[\{\"name\":\"qwen3:4b\",\"size\":3000,\"size_vram\":2000,\"digest\":\"abc\",\"expires_at\":\"2026-10-15T03:23:25.5062797+03:00\",\"context_length\":4096,\"details\":\{\"family\":\"qwen3\"}}]}")
+		})
+		try mux.handle("POST /api/show", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"modelfile\":\"FROM qwen3\",\"parameters\":\"temperature 0.6\",\"template\":\"\{\{ .Prompt }}\",\"details\":\{\"family\":\"qwen3\",\"parameter_size\":\"4.0B\"},\"model_info\":\{\"general.architecture\":\"qwen3\",\"qwen3.context_length\":40960},\"capabilities\":[\"completion\",\"tools\",\"thinking\"]}")
+		})
+		try mux.handle("POST /api/pull", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text("\{\"status\":\"pulling manifest\"}\n\{\"error\":\"pull model manifest: file does not exist\"}\n") when "{body["model"]}" == "nowhere"
+			return ctx.text("\{\"status\":\"pulling manifest\"}\n\{\"status\":\"downloading\",\"digest\":\"sha256:1\",\"total\":100,\"completed\":40}\n\{\"status\":\"downloading\",\"digest\":\"sha256:1\",\"total\":100,\"completed\":100}\n\{\"status\":\"success\"}\n")
+		})
+		try mux.handle("POST /api/copy", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("")
+		})
+		try mux.handle("DELETE /api/delete", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text(404, "\{\"error\":\"model '{body["model"]}' not found\"}")
+		})
+		try mux.handle("HEAD /api/blobs/\{digest}", def (ctx http.Context) !none {
+			heard.paths.push(ctx.request.path())
+			return ctx.text(404, "")
+		})
+		try mux.handle("POST /api/blobs/\{digest}", def (ctx http.Context) !none {
+			let data = try ctx.bytes()
+			heard.paths.push(ctx.request.path())
+			heard.auth.push("{data.len()} bytes")
+			return ctx.text(201, "")
+		})
+		try mux.handle("POST /api/create", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"status\":\"parsing GGUF\"}\n\{\"status\":\"success\"}\n")
+		})
+		try mux.handle("GET /api/version", def (ctx http.Context) !none {
+			return ctx.text("\{\"version\":\"0.35.0\"}")
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		return server
+	}
+
+	internal def failureOf(run def () !none) RemoteErrorKind {
+		let kind = RemoteErrorKind.Protocol
+		run() onerror (err error) {
+			kind = err.kind when err is RemoteError
+			recover none
+		}
+		return kind
+	}
+
+	check "Ollama" {
+		@test()
+		def TestChatRunsToolsAndStreams() !none {
+			let heard = new Heard()
+			let server = try ollamaServer(heard)
+			let ai = new Client(model = "qwen3:4b", host = server.address().str())
+			ai.token = "secret-token"
+			ai.keepAlive = 10min
+			ai.contextSize = 8192
+			let chat = ai.chat()
+			chat.system = "Be brief."
+			chat.temperature = 0.2
+			chat.limit = 100
+			chat.stopAt = ["\n\n"]
+			chat.thinking = true
+			chat.reasoning = llm.Reasoning.High
+			chat.useTool(new OllamaDesk())
+			try chat.ask("Do I need a coat in Oslo?")
+			let pieces string[]
+			for {
+				let piece = try chat.next()
+				break when piece is none
+				pieces.push(piece)
+			}
+			assert pieces.len() == 2 && pieces[0] == "Take a coat" && pieces[1] == "."
+			let messages = chat.messages()
+			assert messages.len() == 5 && messages[2].calls.len() == 1 && messages[2].calls[0].id == "call_1" && messages[3].text == "Oslo: 12 degrees and rain"
+			assert messages[4].thinking == "It rains." && chat.stopReason() is StopReason
+			let used = chat.usage()
+			assert used.inputTokens == 40 && used.outputTokens == 12 && used.cachedTokens == 20
+
+			// The first request: the system message, the tool, the options.
+			let first = heard.bodies[0]
+			assert "{first["model"]}" == "qwen3:4b" && "{first["think"]}" == "high" && "{first["keep_alive"]}" == "600"
+			let options = first["options"]
+			assert options is map<string, any> && "{options["num_ctx"]}" == "8192" && "{options["num_predict"]}" == "100" && options.len() == 4
+			let tools = first["tools"]
+			assert tools is any[] && tools.len() == 1
+			assert heard.auth[0] == "Bearer secret-token"
+			// The second: the call with its arguments as an object, and the
+			// result naming its tool.
+			let second = heard.bodies[1]["messages"]
+			fail "no messages" unless second is any[]
+			assert second.len() == 4
+			let call = second[2]
+			let result = second[3]
+			fail "messages are not objects" unless call is map<string, any> && result is map<string, any>
+			assert "{result["tool_name"]}" == "weather" && "{result["tool_call_id"]}" == "call_1" && "{result["role"]}" == "tool"
+			let calls = call["tool_calls"]
+			fail "no calls" unless calls is any[]
+			assert calls.len() == 1
+
+			// The conversation goes on with another model.
+			chat.model = "qwen3:30b"
+			try chat.say("Thanks")
+			assert "{heard.bodies[2]["model"]}" == "qwen3:30b"
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestFailuresAreRemoteErrors() !none {
+			let heard = new Heard()
+			let server = try ollamaServer(heard)
+			let ai = new Client(model = "missing", host = "http://" + server.address().str() + "/")
+			assert failureOf(def () !none {
+				try ai.chat().say("hello")
+				return none
+			}) == RemoteErrorKind.NotFound
+			assert failureOf(def () !none {
+				try ai.delete("gone")
+				return none
+			}) == RemoteErrorKind.NotFound
+			assert failureOf(def () !none {
+				try ai.pull("nowhere")
+				return none
+			}) == RemoteErrorKind.Server
+			assert failureOf(def () !none {
+				let chat = ai.chat("qwen3:4b")
+				try chat.ask("listen", audio = [new Audio()])
+				return none
+			}) == RemoteErrorKind.BadRequest
+			try server.close()
+			let closed = new Client(host = server.address().str())
+			assert failureOf(def () !none {
+				try closed.version()
+				return none
+			}) == RemoteErrorKind.Transport
+			return none
+		}
+
+		@test()
+		def TestGenerateAndEmbed() !none {
+			let heard = new Heard()
+			let server = try ollamaServer(heard)
+			let ai = new Client(model = "qwen3:4b", host = server.address().str())
+			let completion = try ai.generate("Once", system = "Tell a tale.", limit = 2)
+			assert (try completion.text()) == "Once upon" && completion.stopReason() == StopReason.Limit && completion.usage().outputTokens == 2
+			assert "{heard.bodies[0]["system"]}" == "Tell a tale." && "{heard.bodies[0]["prompt"]}" == "Once"
+
+			let embedder Embedder = ai.embedder("tiny", dimensions = 3)
+			let one = try embedder.embed("a")
+			assert one.len() == 3 && one[0] == float32(0.5)
+			let many = try embedder.embed(string["a", "b"])
+			assert many.len() == 2 && many[1][0] == float32(1.5)
+			assert "{heard.bodies[1]["dimensions"]}" == "3"
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestModels() !none {
+			let heard = new Heard()
+			let server = try ollamaServer(heard)
+			let ai = new Client(host = server.address().str())
+			assert (try ai.version()) == "0.35.0"
+			let list = try ai.models()
+			assert list.len() == 1 && list[0].name == "qwen3:4b" && list[0].details.quantization == "Q4_K_M" && list[0].details.parameters == "4.0B"
+			assert list[0].modified is time.Time
+			let loaded = try ai.running()
+			assert loaded.len() == 1 && loaded[0].gpuSize == 2000 && loaded[0].contextLength == 4096 && !(loaded[0].expires is none)
+			let shown = try ai.show("qwen3:4b")
+			assert shown.capabilities.len() == 3 && shown.capabilities[1] == "tools" && "{shown.info["general.architecture"]}" == "qwen3"
+			let steps string[]
+			try ai.pull("qwen3:4b", progress = def (step Progress) {
+				steps.push("{step.status} {step.completed}/{step.total}")
+			})
+			assert steps.len() == 4 && steps[2] == "downloading 100/100" && steps[3] == "success 0/0"
+			try ai.copy("qwen3:4b", "mine")
+			assert "{heard.bodies[heard.bodies.len() - 1]["destination"]}" == "mine"
+
+			// create uploads the file the server lacks, then names it by digest.
+			let path = "{try os.appHome()}/tiny.gguf"
+			try os.writeFile(path, "GGUF tiny".bytes())
+			try ai.create("tiny", files = [path], system = "Be kind.", quantize = Quantization.Q4KM)
+			let body = heard.bodies[heard.bodies.len() - 1]
+			let files = body["files"]
+			fail "no files" unless files is map<string, any>
+			assert "{files["tiny.gguf"]}".startsWith("sha256:") && "{body["quantize"]}" == "q4_K_M"
+			assert heard.paths.indexOf("/api/blobs/{files["tiny.gguf"]}") >= 0 && heard.auth.indexOf("9 bytes") >= 0
+			try server.close()
+			return none
+		}
+
+		// With ADM_TEST_OLLAMA naming a running server: a short answer, a
+		// tool call, embeddings and the model list from the real thing,
+		// with the smallest models (pulled when missing).
+		@test()
+		def TestLiveServer() !none {
+			return none when liveServer.len() == 0
+			let ai = new Client(model = "qwen3:0.6b", host = liveServer)
+			let names string[]
+			for let (_, m) in try ai.models() {
+				names.push(m.name)
+			}
+			try ai.pull("qwen3:0.6b") unless names.indexOf("qwen3:0.6b") >= 0
+			try ai.pull("all-minilm") unless names.indexOf("all-minilm:latest") >= 0
+			let chat = ai.chat()
+			chat.thinking = false
+			chat.temperature = 0.0
+			chat.limit = 40
+			let answer = try chat.say("What is 2 + 3? Reply with the number only.")
+			assert answer.contains("5")
+			assert chat.usage().inputTokens > 0 && chat.usage().outputTokens > 0
+
+			let tools = ai.chat()
+			tools.thinking = false
+			tools.temperature = 0.0
+			tools.useTool(new OllamaDesk())
+			let reply = try tools.say("What is the weather in Oslo? Use the tool.")
+			let all = tools.messages()
+			assert all.len() >= 4 && all[1].calls.len() >= 1 && all[1].calls[0].name == "weather" && all[2].role == Role.Tool
+			assert reply.len() > 0
+
+			let booking = LiveBooking{}
+			let extracting = ai.chat()
+			extracting.thinking = false
+			extracting.temperature = 0.0
+			try extracting.fill(booking, "Extract the guest's name and the number of nights from this text: Ada Lovelace stays three nights.")
+			fail "filled {booking.guest} {booking.nights}" unless booking.guest.contains("Ada") && booking.nights == 3
+			let vectors = try ai.embedder("all-minilm").embed(string["a cat", "a dog"])
+			assert vectors.len() == 2 && vectors[0].len() == 384
+			let shown = try ai.show("qwen3:0.6b")
+			assert shown.capabilities.indexOf("completion") >= 0
+			return none
+		}
+	}
+}

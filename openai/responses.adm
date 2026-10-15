@@ -1,0 +1,208 @@
+partial module adm.ai.openai {
+	use (
+		std.net.http
+		std.data.encoding::(JSON)
+		std.ai.llm::(ChatRequest, ReplyEvent, ReplyEventKind, Usage, StopReason, RemoteError, RemoteErrorKind, Message, Role, ToolCall, schemaOf, withDocuments)
+	)
+
+	// What starts the reasoning items of a Responses reply kept in
+	// `Message.providerState`, so another provider's state is told apart.
+	const responsesState = "openai-responses "
+
+	// The body of /responses for `request`. The conversation goes whole
+	// (`store` false): earlier replies' reasoning items go back with them.
+	// Fails with RemoteError BadRequest for what the API cannot take:
+	// sound, stop sequences, a seed, top-k.
+	internal def responsesBody(client Client, request ChatRequest) !map<string, any> {
+		let refuse = def (what string) !none {
+			fail RemoteError{message: "openai: the Responses API takes no {what}; set `api` to Api.ChatCompletions", code: "badrequest", kind: RemoteErrorKind.BadRequest}
+		}
+		try refuse("stop sequences") when request.stopAt.len() > 0
+		try refuse("seed") unless request.seed is none
+		try refuse("top-k") unless request.topK is none
+		let input any[] = []
+		for let (_, m) in request.messages {
+			try addItems(input, m, refuse)
+		}
+		let body = map<string, any>{"model": request.model, "input": input, "stream": true, "store": false, "include": ["reasoning.encrypted_content"]}
+		body.set("instructions", request.system) when request.system.len() > 0
+		body.set("max_output_tokens", request.limit) when request.limit > 0
+		body.set("temperature", request.temperature) unless request.temperature is none
+		body.set("top_p", request.topP) unless request.topP is none
+		if request.tools.len() > 0 {
+			let tools any[] = []
+			for let (_, t) in request.tools {
+				tools.push(map<string, any>{"type": "function", "name": t.name, "description": t.description, "parameters": schemaOf(t), "strict": false})
+			}
+			body.set("tools", tools)
+			body.set("parallel_tool_calls", client.parallelToolCalls)
+		}
+		let effort = effortOf(client, request)
+		let named = effort is none ?? ("", effort)
+		let thinking = request.thinking
+		if named.len() > 0 || (thinking is bool && thinking) {
+			let reasoning = new map<string, any>()
+			reasoning.set("effort", named) when named.len() > 0
+			reasoning.set("summary", "auto") when client.summarize && named != "none"
+			body.set("reasoning", reasoning)
+		}
+		let text = new map<string, any>()
+		let verbosity = client.verbosity
+		text.set("verbosity", verbosity.value) unless verbosity is none
+		let schema = request.schema
+		text.set("format", map<string, any>{"type": "json_schema", "name": "reply", "schema": schema, "strict": false}) unless schema is none
+		body.set("text", text) when text.len() > 0
+		let tier = client.serviceTier
+		body.set("service_tier", tier.value) unless tier is none
+		body.set("safety_identifier", client.safetyIdentifier) when client.safetyIdentifier.len() > 0
+		body.set("prompt_cache_key", client.promptCacheKey) when client.promptCacheKey.len() > 0
+		return body
+	}
+
+	// The input items of one message.
+	internal def addItems(input any[], m Message, refuse def (what string) !none) !none {
+		try refuse("sound") when m.audio.len() > 0
+		let shown = withDocuments(m)
+		match m.role {
+			case Role.System:
+				input.push(map<string, any>{"role": "system", "content": shown.text})
+			case Role.User:
+				let parts any[] = []
+				parts.push(map<string, any>{"type": "input_text", "text": shown.text}) when shown.text.len() > 0
+				for let (_, picture) in m.images {
+					parts.push(map<string, any>{"type": "input_image", "image_url": try imageURL(picture), "detail": "auto"})
+				}
+				for let (_, file) in m.files {
+					parts.push(map<string, any>{"type": file.mediaType.startsWith("image/") ?? ("input_image", "input_file"), "file_id": file.id})
+				}
+				input.push(map<string, any>{"role": "user", "content": parts})
+			case Role.Assistant:
+				input.push(...reasoningItems(m.providerState))
+				input.push(map<string, any>{"type": "message", "role": "assistant", "content": [map<string, any>{"type": "output_text", "text": shown.text}]}) when shown.text.len() > 0
+				for let (_, c) in m.calls {
+					input.push(map<string, any>{"type": "function_call", "call_id": c.id, "name": c.name, "arguments": c.arguments.len() > 0 ?? (c.arguments, "\{}")})
+				}
+			case Role.Tool:
+				input.push(map<string, any>{"type": "function_call_output", "call_id": m.callId, "output": shown.text})
+		}
+		return none
+	}
+
+	// The reasoning items a Responses reply left in its message's state;
+	// none for a state of another provider.
+	internal def reasoningItems(state string) any[] {
+		return any[] unless state.startsWith(responsesState)
+		let parsed = (new JSON()).parse(state.slice(responsesState.len())) onerror recover none
+		return parsed is any[] ?? (parsed, any[])
+	}
+
+	// The reply of /responses as it streams (server-sent events).
+	// Implements `llm.ReplyStream`.
+	internal type ResponsesStream {
+		internal res       http.Response
+		internal events    http.EventReader
+		internal pending   ReplyEvent[]
+		internal ended     bool
+		internal calls     int
+		internal refused   bool
+		internal reasoning any[]
+		internal summaries int
+
+		def new(res http.Response) {
+			self.res = res
+			events = new http.EventReader(res.body)
+		}
+
+		// The next event; none after `Done`.
+		// Fails with RemoteError when the connection breaks, or the server
+		// reports an error or a failed response.
+		def next() !?ReplyEvent {
+			for pending.len() == 0 {
+				return none when ended
+				let event = events.next() onerror (err error) {
+					close()
+					fail RemoteError{message: "openai: the reply broke off: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+				}
+				if event is none {
+					close()
+					fail RemoteError{message: "openai: the reply ended before it was done", code: "protocol", kind: RemoteErrorKind.Protocol}
+				}
+				try take(event.data)
+			}
+			let event = pending[0]
+			pending.remove(0)
+			return event
+		}
+
+		// Stops reading the reply.
+		def close() {
+			ended = true
+			res.close() onerror recover none
+		}
+
+		internal def take(data string) !none {
+			let parsed = (new JSON()).parse(data) onerror (err error) {
+				close()
+				fail RemoteError{message: "openai: an event is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+			}
+			return none unless parsed is map<string, any>
+			let name = textAt(parsed, "type")
+			match name {
+				case "response.output_text.delta":
+					pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: textAt(parsed, "delta")})
+				case "response.refusal.delta":
+					refused = true
+					pending.push(ReplyEvent{kind: ReplyEventKind.Text, text: textAt(parsed, "delta")})
+				case "response.reasoning_summary_part.added":
+					summaries++
+					pending.push(ReplyEvent{kind: ReplyEventKind.Thinking, text: "\n\n"}) when summaries > 1
+				case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+					pending.push(ReplyEvent{kind: ReplyEventKind.Thinking, text: textAt(parsed, "delta")})
+				case "response.output_item.done":
+					let item = objectAt(parsed, "item")
+					let kind = textAt(item, "type")
+					if kind == "function_call" {
+						calls++
+						let id = textAt(item, "call_id")
+						pending.push(ReplyEvent{kind: ReplyEventKind.Call, call: new ToolCall(id.len() > 0 ?? (id, "call_{calls}"), textAt(item, "name"), textAt(item, "arguments"))})
+					} else if kind == "reasoning" {
+						reasoning.push(item)
+					}
+				case "response.completed", "response.incomplete":
+					let response = objectAt(parsed, "response")
+					let reason = textAt(objectAt(response, "incomplete_details"), "reason")
+					let stop = reason == "max_output_tokens" ?? (StopReason.Limit, reason == "content_filter" || refused ?? (StopReason.Filtered, calls > 0 ?? (StopReason.Calls, StopReason.End)))
+					let state = reasoning.len() > 0 ?? (responsesState + string((new JSON()).encode(reasoning)), "")
+					pending.push(ReplyEvent{kind: ReplyEventKind.Done, stop: stop, usage: responsesUsage(objectAt(response, "usage")), state: state})
+					close()
+				case "response.failed":
+					close()
+					let error = objectAt(objectAt(parsed, "response"), "error")
+					fail failedError(textAt(error, "code"), textAt(error, "message"))
+				case "error":
+					close()
+					let inner = objectAt(parsed, "error")
+					let source = inner.len() > 0 ?? (inner, parsed)
+					fail failedError(textAt(source, "code"), textAt(source, "message"))
+				default:
+			}
+			return none
+		}
+	}
+
+	// The error a stream reports mid-reply, by OpenAI's code.
+	internal def failedError(code string, message string) RemoteError {
+		let kind = RemoteErrorKind.Server
+		kind = RemoteErrorKind.RateLimited when code := "rate_limit_exceeded" || "insufficient_quota"
+		kind = RemoteErrorKind.ContentFiltered when code := "content_filter" || "content_policy_violation"
+		kind = RemoteErrorKind.BadRequest when code := "invalid_prompt" || "context_length_exceeded" || "invalid_request_error"
+		kind = RemoteErrorKind.Overloaded when code := "server_is_overloaded" || "slow_down"
+		return RemoteError{message: "openai: {message.len() > 0 ?? (message, code)}", code: kind.value, kind: kind, remoteCode: code}
+	}
+
+	internal def responsesUsage(usage map<string, any>) Usage {
+		let input = objectAt(usage, "input_tokens_details")
+		let output = objectAt(usage, "output_tokens_details")
+		return Usage{inputTokens: intAt(usage, "input_tokens"), outputTokens: intAt(usage, "output_tokens"), cachedTokens: intAt(input, "cached_tokens"), cacheWriteTokens: intAt(input, "cache_write_tokens"), thinkingTokens: intAt(output, "reasoning_tokens")}
+	}
+}

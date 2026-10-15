@@ -1,3 +1,401 @@
+// An Anthropic API client over std.net.http: the Messages API of the
+// Claude models. Its conversations are std.ai.llm's: `chat()` gives a
+// `llm.RemoteChat`, with tools, `@tool` methods, MCP tools, pictures and
+// documents as a local `llm.Session` takes them.
+//
+// ```
+// let ai = new anthropic.Client(model = "claude-opus-5-5")   // ANTHROPIC_API_KEY
+// let chat = ai.chat()
+// print(try chat.say("Name three primes."))
+// chat.model = "claude-haiku-5-5"
+// print(try chat.say("And their sum?"))
+// ```
 partial module adm.ai.anthropic {
-	// Anthropic Messages API over std.net.http: chat with tool use, streaming, extended thinking, prompt caching, token counting, files, message batches
+	use (
+		std.bytes
+		std.net.http
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON, Base64)
+		std.formats.image::(Image)
+		std.formats.docs
+		std.ai.llm::(RemoteChat, ChatRequest, ReplyStream, RemoteError, RemoteErrorKind, Message, Role, Reasoning, schemaOf, remoteErrorKind)
+	)
+
+	// Anthropic's address; `baseURL` replaces it for a gateway.
+	const anthropicURL = "https://api.anthropic.com/v1"
+
+	// The API version every request names.
+	const apiVersion = "2023-06-01"
+
+	// What starts the content blocks of a reply kept in
+	// `Message.providerState`, so another provider's state is told apart.
+	const blocksState = "anthropic "
+
+	// The models that take `fallbacks: "default"`: a reply their safety
+	// classifiers decline is served by another model in the same call.
+	const fallbackModels = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]
+
+	// How long the model thinks, beyond the conversation's `reasoning`
+	// levels (which map to Low, Medium and High).
+	enum Effort {
+		Low    = "low",
+		Medium = "medium",
+		High   = "high",
+		XHigh  = "xhigh",
+		Max    = "max",
+	}
+
+	// How long a prompt the API caches lives: the conversation so far is
+	// cached at every request, so the next reads it at a tenth of the
+	// price.
+	enum Caching {
+		// No caching.
+		Off,
+		// Five minutes from its last use.
+		FiveMinutes,
+		// An hour from its last use (writes cost more).
+		OneHour,
+	}
+
+	// What the API shows of the model's thinking.
+	enum ThinkingDisplay {
+		// A readable summary, streamed as thinking text.
+		Summarized = "summarized",
+		// Nothing: the thinking blocks carry only their signatures.
+		Omitted    = "omitted",
+	}
+
+	// A connection to the Anthropic API: the key, the model new
+	// conversations use, and settings every request carries. It holds no
+	// connection of its own (std.net.http keeps them), so any number of
+	// tasks may share it.
+	//
+	// Requests fail with `llm.RemoteError`: Auth for a missing or wrong
+	// key, RateLimited and Overloaded (529) when the API is busy (the client
+	// retries those first), BadRequest for a request it refuses (a prompt
+	// longer than the context included), NotFound, Server for its own
+	// failures, Transport when it cannot be reached.
+	partial type Client {
+		// The model `chat()` uses ("claude-opus-5-5"); a conversation keeps its
+		// own copy, which can change between replies.
+		model             string
+		apiKey            ?Secret<string>
+		// The API's base: `https://api.anthropic.com/v1`, or a gateway's.
+		baseURL           string
+		// Overrides the conversation's `reasoning` with a level it cannot
+		// name (XHigh, Max).
+		effort            ?Effort         = none
+		// What the API shows of the thinking when the conversation asks for
+		// it.
+		display           ThinkingDisplay = ThinkingDisplay.Summarized
+		// A thinking budget in tokens for models before Claude 4.6, which
+		// take one instead of adaptive thinking; 0 for adaptive.
+		thinkingBudget    int             = 0
+		caching           Caching         = Caching.FiveMinutes
+		// Lets a declined reply of the models that allow it be served by
+		// another model in the same call.
+		refusalFallback   bool            = true
+		// Streams tool arguments as the model writes them.
+		eagerToolInput    bool            = true
+		// Lets the model ask for several calls in one reply.
+		parallelToolCalls bool            = true
+		// An id of the end user, for Anthropic's abuse detection.
+		userId            string          = ""
+		// "auto" or "standard_only"; "" for the account's default.
+		serviceTier       string          = ""
+		// Beta features to switch on (`anthropic-beta`).
+		betas             string[]
+		// The HTTP client requests go through: headers, timeouts, a
+		// transport. Rate-limited and overloaded replies are sent again
+		// (`retry`).
+		httpClient        http.Client
+
+		// A client with `apiKey` (else `ANTHROPIC_API_KEY`), of the API at
+		// `baseURL` (else `ANTHROPIC_BASE_URL`, else Anthropic's).
+		def new(model string = "", apiKey ?Secret<string> = none, baseURL string = "") {
+			self.model = model
+			let key = Runtime.getEnv("ANTHROPIC_API_KEY")
+			self.apiKey = apiKey is none ?? (key is none ?? (none, key), apiKey)
+			let url = Runtime.getEnv("ANTHROPIC_BASE_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, url is none ?? (anthropicURL, url.trimEnd("/") + "/v1"))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.retry = http.RetryPolicy{attempts: 3, statuses: [429, 500, 502, 503, 504, 529], allMethods: true}
+		}
+
+		// A conversation with `model` (none: the client's). It is a
+		// `llm.Chat`.
+		def chat(model string = "") RemoteChat {
+			return new RemoteChat(self, model.len() > 0 ?? (model, self.model))
+		}
+
+		// Sends `request` to /messages and returns the reply as it streams:
+		// what `RemoteChat` calls. Implements `llm.ChatProvider`.
+		// Fails with RemoteError when the API refuses the request, or a
+		// message carries sound.
+		def reply(request ChatRequest) !ReplyStream {
+			let body = try messagesBody(self, request)
+			body.set("stream", true)
+			let res = try post(self, "/messages", body, betasFor(self, request.model))
+			return new MessageStream(res)
+		}
+	}
+
+	// The beta headers a request to `model` needs.
+	internal def betasFor(client Client, model string) string[] {
+		let out = client.betas.clone()
+		out.push("server-side-fallback-2026-07-01") when usesFallback(client, model)
+		return out
+	}
+
+	internal def usesFallback(client Client, model string) bool {
+		return client.refusalFallback && fallbackModels.indexOf(model) >= 0
+	}
+
+	// The body of /messages (and of count_tokens, batches) for `request`,
+	// without `stream`.
+	internal def messagesBody(client Client, request ChatRequest) !map<string, any> {
+		let messages any[] = []
+		for let (k, m) in request.messages {
+			try addMessage(messages, m, k)
+		}
+		let body = map<string, any>{"model": request.model, "max_tokens": request.limit > 0 ?? (request.limit, 4096), "messages": messages}
+		body.set("system", request.system) when request.system.len() > 0
+		body.set("temperature", request.temperature) unless request.temperature is none
+		body.set("top_p", request.topP) unless request.topP is none
+		body.set("top_k", request.topK) unless request.topK is none
+		body.set("stop_sequences", texts(request.stopAt)) when request.stopAt.len() > 0
+		if request.tools.len() > 0 {
+			let tools any[] = []
+			for let (_, t) in request.tools {
+				let tool = map<string, any>{"name": t.name, "description": t.description, "input_schema": schemaOf(t)}
+				tool.set("eager_input_streaming", true) when client.eagerToolInput
+				tools.push(tool)
+			}
+			body.set("tools", tools)
+			body.set("tool_choice", map<string, any>{"type": "auto", "disable_parallel_tool_use": true}) unless client.parallelToolCalls
+		}
+		let thinking = request.thinking
+		if thinking is bool {
+			if !thinking {
+				body.set("thinking", map<string, any>{"type": "disabled"})
+			} else if client.thinkingBudget > 0 {
+				body.set("thinking", map<string, any>{"type": "enabled", "budget_tokens": client.thinkingBudget})
+			} else {
+				body.set("thinking", map<string, any>{"type": "adaptive", "display": client.display.value})
+			}
+		}
+		let output = new map<string, any>()
+		let effort = effortOf(client, request)
+		output.set("effort", effort) when effort.len() > 0
+		let schema = request.schema
+		output.set("format", map<string, any>{"type": "json_schema", "schema": schema}) unless schema is none
+		body.set("output_config", output) when output.len() > 0
+		match client.caching {
+			case Caching.FiveMinutes:
+				body.set("cache_control", map<string, any>{"type": "ephemeral"})
+			case Caching.OneHour:
+				body.set("cache_control", map<string, any>{"type": "ephemeral", "ttl": "1h"})
+			default:
+		}
+		body.set("metadata", map<string, any>{"user_id": client.userId}) when client.userId.len() > 0
+		body.set("service_tier", client.serviceTier) when client.serviceTier.len() > 0
+		body.set("fallbacks", "default") when usesFallback(client, request.model)
+		return body
+	}
+
+	// The effort level of a request: the client's override, else the
+	// conversation's; "" for the model's default.
+	internal def effortOf(client Client, request ChatRequest) string {
+		let forced = client.effort
+		return forced.value unless forced is none
+		let level = request.reasoning
+		return "" when level is none
+		match level {
+			case Reasoning.Low:
+				return "low"
+			case Reasoning.Medium:
+				return "medium"
+			case Reasoning.High:
+				return "high"
+		}
+		return ""
+	}
+
+	// Adds message `m` (the k-th of the conversation) to the API's list. A
+	// tool's result joins the user message before it when that one holds
+	// results too: a reply's calls are answered in one message. A system
+	// message mid-conversation stays one.
+	internal def addMessage(messages any[], m Message, k int) !none {
+		fail RemoteError{message: "anthropic: the Messages API takes no sound; message {k} carries {m.audio.len()} recordings", code: "badrequest", kind: RemoteErrorKind.BadRequest} when m.audio.len() > 0
+		match m.role {
+			case Role.System:
+				messages.push(map<string, any>{"role": "system", "content": m.text})
+			case Role.Tool:
+				let result = map<string, any>{"type": "tool_result", "tool_use_id": m.callId, "content": m.text}
+				let joined = resultsMessage(messages)
+				if joined is map<string, any> {
+					let content = joined.get("content")
+					if content is any[] {
+						content.push(result)
+						joined.set("content", content)
+						return none
+					}
+				}
+				let content any[] = []
+				content.push(result)
+				messages.push(map<string, any>{"role": "user", "content": content})
+			case Role.Assistant:
+				messages.push(map<string, any>{"role": "assistant", "content": try assistantContent(m)})
+			case Role.User:
+				let content any[] = []
+				let codec = new Base64()
+				for let (_, picture) in m.images {
+					content.push(map<string, any>{"type": "image", "source": map<string, any>{"type": "base64", "media_type": "image/png", "data": codec.encode(try pngOf(picture))}})
+				}
+				for let (_, doc) in m.documents {
+					let block = map<string, any>{"type": "document", "source": map<string, any>{"type": "text", "media_type": "text/plain", "data": new docs.Markdown().encode(doc)}}
+					block.set("title", doc.title) when doc.title.len() > 0
+					content.push(block)
+				}
+				for let (_, file) in m.files {
+					content.push(map<string, any>{"type": file.mediaType.startsWith("image/") ?? ("image", "document"), "source": map<string, any>{"type": "file", "file_id": file.id}})
+				}
+				content.push(map<string, any>{"type": "text", "text": m.text}) when m.text.len() > 0
+				messages.push(map<string, any>{"role": "user", "content": content})
+		}
+		return none
+	}
+
+	// The last message when it is a user message of tool results, which
+	// the next result joins; none otherwise.
+	internal def resultsMessage(messages any[]) ?map<string, any> {
+		return none when messages.len() == 0
+		let last = messages[messages.len() - 1]
+		return none unless last is map<string, any>
+		let role = last.get("role")
+		return none unless role is string && role == "user"
+		let content = last.get("content")
+		return none unless content is any[] && content.len() > 0
+		let first = content[0]
+		return none unless first is map<string, any>
+		let kind = first.get("type")
+		return kind is string && kind == "tool_result" ?? (last, none)
+	}
+
+	// The content of an assistant message: the reply's blocks as the API
+	// sent them (thinking with its signature, text, calls) when the
+	// message keeps them, else built from its text and calls.
+	internal def assistantContent(m Message) !any[] {
+		if m.providerState.startsWith(blocksState) {
+			let parsed = (new JSON()).parse(m.providerState.slice(blocksState.len())) onerror recover none
+			return parsed when parsed is any[]
+		}
+		let content any[] = []
+		content.push(map<string, any>{"type": "text", "text": m.text}) when m.text.len() > 0
+		for let (_, c) in m.calls {
+			let input = (new JSON()).parse(c.arguments.len() > 0 ?? (c.arguments, "\{}")) onerror recover new map<string, any>()
+			content.push(map<string, any>{"type": "tool_use", "id": c.id, "name": c.name, "input": input})
+		}
+		return content
+	}
+
+	// A JSON request to the API. Fails with the RemoteError the reply
+	// describes when it is not a success.
+	internal def post(client Client, path string, body map<string, any>, betas string[] = string[]) !http.Response {
+		let req = try request(client, http.Method.POST, path, betas)
+		req.replaceBody((new JSON()).encode(body))
+		req.headers.set("Content-Type", "application/json")
+		return try sent(client, req)
+	}
+
+	internal def request(client Client, method http.Method, path string, betas string[] = string[]) !http.Request {
+		let req = try client.httpClient.request(method, client.baseURL + path)
+		let key = client.apiKey
+		req.headers.set("x-api-key", key.reveal()) unless key is none
+		req.headers.set("anthropic-version", apiVersion)
+		req.headers.set("anthropic-beta", betas.join(",")) when betas.len() > 0
+		return req
+	}
+
+	internal def sent(client Client, req http.Request) !http.Response {
+		let res = client.httpClient.do(req) onerror (err error) {
+			fail RemoteError{message: "anthropic: {client.baseURL}: {err.message}", code: "transport", cause: err, kind: RemoteErrorKind.Transport}
+		}
+		try checked(res)
+		return res
+	}
+
+	// Fails with the RemoteError a reply's status and body describe when
+	// it is not a success: `{"type": "error", "error": {"type", "message"}}`.
+	internal def checked(res http.Response) !none {
+		return none when res.ok()
+		let text = res.text() onerror recover ""
+		res.close() onerror recover none
+		let parsed = (new JSON()).parse(text) onerror recover none
+		let error = parsed is map<string, any> ?? (objectAt(parsed, "error"), new map<string, any>())
+		let errorType = textAt(error, "type")
+		let message = textAt(error, "message")
+		let kind = errorType == "overloaded_error" ?? (RemoteErrorKind.Overloaded, remoteErrorKind(res.status))
+		fail RemoteError{message: "anthropic: {message.len() > 0 ?? (message, text.len() > 0 ?? (text.trim(), res.reason))}", code: kind.value, kind: kind, status: res.status, remoteCode: errorType, requestId: res.header("request-id"), retryAfter: res.retryAfter()}
+	}
+
+	// The error an `error` event mid-stream reports, by its type.
+	internal def streamError(error map<string, any>) RemoteError {
+		let errorType = textAt(error, "type")
+		let kind = RemoteErrorKind.Server
+		kind = RemoteErrorKind.Overloaded when errorType == "overloaded_error"
+		kind = RemoteErrorKind.RateLimited when errorType == "rate_limit_error"
+		kind = RemoteErrorKind.BadRequest when errorType == "invalid_request_error"
+		return RemoteError{message: "anthropic: {textAt(error, "message")}", code: kind.value, kind: kind, remoteCode: errorType}
+	}
+
+	internal def pngOf(picture Image) !byte[] {
+		let buffer = new bytes.Buffer()
+		try picture.write(buffer, ".png")
+		return buffer.bytes()
+	}
+
+	internal def texts(list string[]) any[] {
+		let out any[] = []
+		for let (_, s) in list {
+			out.push(s)
+		}
+		return out
+	}
+
+	// The text of `key` in an object; "" when absent or not a string.
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return v when v is string
+		return "{v}" when v is int
+		return ""
+	}
+
+	internal def intAt(object map<string, any>, key string) int {
+		let v = object.get(key)
+		return v when v is int
+		return int(v) when v is float
+		return 0
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
+
+	internal def listAt(object map<string, any>, key string) any[] {
+		let v = object.get(key)
+		return v is any[] ?? (v, any[])
+	}
+
+	// A whole reply's JSON object.
+	internal def objectOf(res http.Response) !map<string, any> {
+		let text = try res.text()
+		let parsed = (new JSON()).parse(text) onerror (err error) {
+			fail RemoteError{message: "anthropic: the reply is not JSON: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol, status: res.status}
+		}
+		fail RemoteError{message: "anthropic: the reply is not a JSON object", code: "protocol", kind: RemoteErrorKind.Protocol, status: res.status} unless parsed is map<string, any>
+		return parsed
+	}
 }

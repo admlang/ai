@@ -19,21 +19,33 @@ cloud libraries, since they take the cloud's credentials: `adm.cloud.aws.bedrock
 
 ## One shape
 
-The clients share one shape, so a program can move between a provider and a local model:
+The clients share `std.ai`'s shapes, so a program moves between a provider and a local model
+by changing one line:
 
-- a `Client` made from an API key (a `Secret<string>`, or the provider's usual environment
-  variable when none is given) and an optional base URL;
-- `chat` takes a prompt or a list of `std.ai.llm` messages, and tool declarations and returns a reply, or streams it
-  as the tokens arrive; tool calls come back typed and the answers go in as messages;
-- `embed` returns vectors as `float[]`;
-- every failure is one error type per library with a `kind` (`Auth`, `RateLimited`,
-  `Overloaded`, `BadRequest`, `NotFound`, `ContentFiltered`, `Transport`, `Server`), the
+- a `Client` made with the model and a key (a `Secret<string>`, or the provider's usual
+  environment variable when none is given) and an optional base URL;
+- `client.chat()` is a `llm.RemoteChat`, the conversation of `std.ai.llm`: `ask`, `next`,
+  `say`, `system`, tools (`@tool` methods, MCP tools) run in rounds, `answer` for calls the
+  program runs itself, pictures, documents, sound and uploaded files, `usage()`. Its `model`
+  can change between replies. It is a `llm.Chat`, as a local `Session` is;
+- `client.embedder(model)` is a `std.ai.embeddings.Embedder`, as a local model is;
+- every failure is a `llm.RemoteError` with a `kind` (`Auth`, `RateLimited`, `Overloaded`,
+  `BadRequest`, `NotFound`, `ContentFiltered`, `Transport`, `Server`, `Protocol`), the
   provider's own code and message, the request id, and the pause a `Retry-After` asked for.
-  Rate-limited and overloaded calls are retried with backoff up to a limit the client sets;
-- usage (input, output and cached tokens) comes with every reply.
+  Rate-limited and overloaded calls are retried by the client's `http.Client` first.
 
-What is specific to a provider (reasoning effort, prompt caching, grounding, safety settings)
-is a typed option of that library, never a string the program has to know.
+```adm
+def summarise(chat llm.Chat, text string) !string {
+	return try chat.say("Summarise in one line: {text}")
+}
+
+print(try summarise(new anthropic.Client(model = "claude-opus-5-5").chat(), report))
+print(try summarise((try llm.load("qwen3-4b.gguf")).session(), report))
+```
+
+What is specific to a provider (reasoning effort, prompt caching, grounding, safety settings,
+files, batches) is a typed setting or method of that library, never a string the program has
+to know.
 
 ## Tests
 

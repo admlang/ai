@@ -1,0 +1,453 @@
+partial module adm.ai.openai {
+	use (
+		std.os
+		std.bytes
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON, Base64)
+		std.formats.image::(Image)
+		std.formats.audio::(Audio, AudioInfo)
+		std.ai.llm
+		std.ai.llm::(Message, Role, RemoteError, RemoteErrorKind, StopReason, tool)
+		std.ai.embeddings::(Embedder)
+	)
+
+	// The live test calls OpenAI with `ADM_TEST_OPENAI_KEY` (models
+	// gpt-5-mini and text-embedding-3-small), or the compatible server at
+	// `ADM_TEST_OPENAI_URL` (`http://127.0.0.1:11434/v1`: Ollama's, models
+	// qwen3:0.6b and all-minilm); `ADM_TEST_OPENAI_MODEL` and
+	// `ADM_TEST_OPENAI_EMBED` choose others.
+	@env("ADM_TEST_OPENAI_URL")
+	internal const liveURL string
+
+	@env("ADM_TEST_OPENAI_KEY")
+	internal const liveKey string
+
+	@env("ADM_TEST_OPENAI_MODEL")
+	internal const liveModel string
+
+	@env("ADM_TEST_OPENAI_EMBED")
+	internal const liveEmbed string
+
+
+	// What the live tests fill from a sentence.
+	internal struct LiveBooking {
+		guest  string
+		nights int
+	}
+
+	internal type OpenDesk {
+		// The weather of a city.
+		// @param city the city's name
+		@tool
+		def weather(city string) string {
+			return "{city}: 12 degrees and rain"
+		}
+	}
+
+	// What the loopback server was sent.
+	internal type Sent {
+		bodies  map<string, any>[]
+		paths   string[]
+		headers string[]
+		forms   string[]
+	}
+
+	// One server-sent event of JSON `data`.
+	internal def sse(data string) string {
+		return "data: {data}\n\n"
+	}
+
+	internal def openaiServer(sent Sent) !httptest.Server {
+		let mux = new http.ServeMux()
+		let codec = new JSON()
+		let keep = def (ctx http.Context) !map<string, any> {
+			let body = new map<string, any>()
+			sent.paths.push(ctx.request.path())
+			sent.headers.push("{ctx.header("Authorization")}|{ctx.header("OpenAI-Organization")}")
+			if ctx.header("Content-Type").startsWith("application/json") {
+				let parsed = try codec.parse(try ctx.text())
+				body = parsed when parsed is map<string, any>
+			} else {
+				// Strings hold no NUL: the PNG and WAV parts' zero bytes
+				// become spaces, so the form reads as text.
+				let data = try ctx.bytes()
+				for let i = 0; i < data.len(); i++ {
+					data[i] = byte(32) when data[i] == byte(0)
+				}
+				sent.forms.push(string(data))
+			}
+			sent.bodies.push(body)
+			return body
+		}
+		try mux.handle("POST /v1/responses", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			if "{body["model"]}" == "secret" {
+				ctx.response.headers.set("x-request-id", "req_123")
+				return ctx.text(401, "\{\"error\":\{\"message\":\"Incorrect API key provided\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}")
+			}
+			return ctx.text(sse("\{\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}") + sse("\{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"The server had an error\"}")) when "{body["model"]}" == "breaks"
+			let input = body["input"]
+			let answered = false
+			if input is any[] {
+				for let (_, item) in input {
+					answered = answered || (item is map<string, any> && "{item.get("type")}" == "function_call_output")
+				}
+			}
+			if answered {
+				let out = sse("\{\"type\":\"response.output_text.delta\",\"delta\":\"Take a coat\"}") + sse("\{\"type\":\"response.output_text.delta\",\"delta\":\".\"}")
+				return ctx.text(out + sse("\{\"type\":\"response.incomplete\",\"response\":\{\"incomplete_details\":\{\"reason\":\"max_output_tokens\"},\"usage\":\{\"input_tokens\":50,\"input_tokens_details\":\{\"cached_tokens\":40},\"output_tokens\":3,\"output_tokens_details\":\{\"reasoning_tokens\":0}}}}"))
+			}
+			let out = sse("\{\"type\":\"response.created\",\"response\":\{}}")
+			out += sse("\{\"type\":\"response.reasoning_summary_part.added\"}") + sse("\{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Rain?\"}")
+			out += sse("\{\"type\":\"response.reasoning_summary_part.added\"}") + sse("\{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Ask the tool.\"}")
+			out += sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"gAAA\"}}")
+			out += sse("\{\"type\":\"response.function_call_arguments.delta\",\"delta\":\"\{\\\"city\"}")
+			out += sse("\{\"type\":\"response.output_item.done\",\"item\":\{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_9\",\"name\":\"weather\",\"arguments\":\"\{\\\"city\\\":\\\"Oslo\\\"}\"}}")
+			out += sse("\{\"type\":\"response.completed\",\"response\":\{\"status\":\"completed\",\"usage\":\{\"input_tokens\":20,\"input_tokens_details\":\{\"cached_tokens\":0},\"output_tokens\":30,\"output_tokens_details\":\{\"reasoning_tokens\":25}}}}")
+			return ctx.text(out)
+		})
+		try mux.handle("POST /v1/chat/completions", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			let messages = body["messages"]
+			let answered = false
+			if messages is any[] {
+				for let (_, m) in messages {
+					answered = answered || (m is map<string, any> && "{m.get("role")}" == "tool")
+				}
+			}
+			if answered {
+				let out = sse("\{\"choices\":[\{\"index\":0,\"delta\":\{\"content\":\"Take a coat.\"},\"finish_reason\":null}]}")
+				out += sse("\{\"choices\":[\{\"index\":0,\"delta\":\{},\"finish_reason\":\"stop\"}]}")
+				out += sse("\{\"choices\":[],\"usage\":\{\"prompt_tokens\":40,\"completion_tokens\":4,\"prompt_tokens_details\":\{\"cached_tokens\":32}}}")
+				return ctx.text(out + "data: [DONE]\n\n")
+			}
+			let out = sse("\{\"choices\":[\{\"index\":0,\"delta\":\{\"role\":\"assistant\",\"reasoning_content\":\"Use the tool.\"}}]}")
+			out += sse("\{\"choices\":[\{\"index\":0,\"delta\":\{\"tool_calls\":[\{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":\{\"name\":\"weather\",\"arguments\":\"\"}}]}}]}")
+			out += sse("\{\"choices\":[\{\"index\":0,\"delta\":\{\"tool_calls\":[\{\"index\":0,\"function\":\{\"arguments\":\"\{\\\"city\\\":\"}}]}}]}")
+			out += sse("\{\"choices\":[\{\"index\":0,\"delta\":\{\"tool_calls\":[\{\"index\":0,\"function\":\{\"arguments\":\"\\\"Oslo\\\"}\"}}]}}]}")
+			out += sse("\{\"choices\":[\{\"index\":0,\"delta\":\{},\"finish_reason\":\"tool_calls\"}]}")
+			out += sse("\{\"choices\":[],\"usage\":\{\"prompt_tokens\":10,\"completion_tokens\":12,\"completion_tokens_details\":\{\"reasoning_tokens\":5}}}")
+			return ctx.text(out + "data: [DONE]\n\n")
+		})
+		try mux.handle("POST /v1/embeddings", def (ctx http.Context) !none {
+			try keep(ctx)
+			// Out of order, as the API may send them.
+			return ctx.text("\{\"data\":[\{\"index\":1,\"embedding\":[0.5,2]},\{\"index\":0,\"embedding\":[1,0.25]}]}")
+		})
+		try mux.handle("GET /v1/models", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"data\":[\{\"id\":\"m3\",\"owned_by\":\"openai\",\"created\":1700000000}],\"has_more\":false}") when ctx.request.query("after", "") == "m2"
+			return ctx.text("\{\"data\":[\{\"id\":\"m1\",\"owned_by\":\"system\"},\{\"id\":\"m2\",\"owned_by\":\"openai\"}],\"has_more\":true}")
+		})
+		try mux.handle("POST /v1/images/generations", def (ctx http.Context) !none {
+			try keep(ctx)
+			let picture = new Image(3, 2)
+			return ctx.text("\{\"data\":[\{\"b64_json\":\"{(new Base64()).encode(try pngOf(picture))}\"}]}")
+		})
+		try mux.handle("POST /v1/images/edits", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"data\":[\{\"b64_json\":\"{(new Base64()).encode(try pngOf(new Image(2, 2)))}\"}]}")
+		})
+		try mux.handle("POST /v1/images/variations", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"data\":[\{\"b64_json\":\"{(new Base64()).encode(try pngOf(new Image(1, 1)))}\"},\{\"b64_json\":\"{(new Base64()).encode(try pngOf(new Image(1, 1)))}\"}]}")
+		})
+		try mux.handle("POST /v1/audio/translations", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"text\":\"good morning\"}")
+		})
+		try mux.handle("GET /v1/models/\{id}", def (ctx http.Context) !none {
+			return ctx.text("\{\"id\":\"{ctx.request.param("id")}\",\"owned_by\":\"openai\"}")
+		})
+		try mux.handle("GET /v1/files", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"data\":[\{\"id\":\"file-1\",\"purpose\":\"{ctx.request.query("purpose", "any")}\"}],\"has_more\":false}")
+		})
+		try mux.handle("GET /v1/vector_stores", def (ctx http.Context) !none {
+			return ctx.text("\{\"data\":[\{\"id\":\"vs_1\",\"name\":\"docs\"}],\"has_more\":false}")
+		})
+		try mux.handle("POST /v1/vector_stores/\{id}", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text("\{\"id\":\"{ctx.request.param("id")}\",\"name\":\"{body["name"]}\"}")
+		})
+		try mux.handle("POST /v1/vector_stores/\{id}/files", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"file-1\",\"status\":\"in_progress\",\"usage_bytes\":0}")
+		})
+		try mux.handle("DELETE /v1/vector_stores/\{id}/files/\{file}", def (ctx http.Context) !none {
+			sent.paths.push(ctx.request.path())
+			return ctx.text("\{\"deleted\":true}")
+		})
+		try mux.handle("GET /v1/batches", def (ctx http.Context) !none {
+			return ctx.text("\{\"data\":[\{\"id\":\"batch_1\",\"status\":\"completed\",\"output_file_id\":\"file-2\"}],\"has_more\":false}")
+		})
+		try mux.handle("POST /v1/audio/transcriptions", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"text\":\"hello there\",\"language\":\"english\",\"duration\":1.5,\"segments\":[\{\"start\":0.0,\"end\":1.5,\"text\":\"hello there\"}]}")
+		})
+		try mux.handle("POST /v1/audio/speech", def (ctx http.Context) !none {
+			try keep(ctx)
+			let sound = new Audio()
+			sound.info = AudioInfo{sampleRate: 24000, channels: 1}
+			sound.samples = float32[0.0, 0.5, -0.5, 0.25]
+			return ctx.blob(200, "audio/wav", try wavOf(sound))
+		})
+		try mux.handle("POST /v1/files", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"file-1\",\"filename\":\"requests.jsonl\",\"bytes\":12,\"purpose\":\"batch\",\"created_at\":1700000000}")
+		})
+		try mux.handle("GET /v1/files/\{id}/content", def (ctx http.Context) !none {
+			return ctx.text("\{\"custom_id\":\"1\"}\n")
+		})
+		try mux.handle("DELETE /v1/files/\{id}", def (ctx http.Context) !none {
+			return ctx.text(404, "\{\"error\":\{\"message\":\"No such File object: gone\",\"type\":\"invalid_request_error\"}}") when ctx.request.param("id") == "gone"
+			return ctx.text("\{\"id\":\"{ctx.request.param("id")}\",\"deleted\":true}")
+		})
+		try mux.handle("POST /v1/vector_stores", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"vs_1\",\"name\":\"docs\",\"status\":\"in_progress\",\"file_counts\":\{\"in_progress\":1,\"total\":1},\"usage_bytes\":0}")
+		})
+		try mux.handle("POST /v1/vector_stores/\{id}/search", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"data\":[\{\"file_id\":\"file-1\",\"filename\":\"a.md\",\"score\":0.9,\"content\":[\{\"type\":\"text\",\"text\":\"Kettles \"},\{\"type\":\"text\",\"text\":\"boil.\"}]}]}")
+		})
+		try mux.handle("POST /v1/batches", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"batch_1\",\"status\":\"validating\",\"endpoint\":\"/v1/responses\",\"input_file_id\":\"file-1\",\"request_counts\":\{\"total\":0}}")
+		})
+		try mux.handle("POST /v1/batches/\{id}/cancel", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\":\"batch_1\",\"status\":\"cancelling\",\"request_counts\":\{\"total\":2,\"completed\":1}}")
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		return server
+	}
+
+	internal def failure(run def () !none) RemoteError {
+		let caught = RemoteError{message: "no failure", kind: RemoteErrorKind.Protocol}
+		run() onerror (err error) {
+			caught = err when err is RemoteError
+			recover none
+		}
+		return caught
+	}
+
+	check "OpenAI" {
+		@test()
+		def TestResponsesApi() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(model = "gpt-5-mini", apiKey = "sk-test", baseURL = "http://{server.address().str()}/v1")
+			ai.api = Api.Responses
+			ai.organization = "org-1"
+			let chat = ai.chat()
+			chat.system = "Be brief."
+			chat.limit = 200
+			chat.reasoning = llm.Reasoning.Low
+			chat.showThinking = true
+			chat.useTool(new OpenDesk())
+			let shown = try chat.say("Coat in Oslo?")
+			assert shown == "Take a coat." && chat.stopReason() is StopReason
+			let all = chat.messages()
+			assert all.len() == 5 && all[2].thinking == "Rain?\n\nAsk the tool." && all[2].calls[0].id == "call_9" && all[2].providerState.startsWith(responsesState)
+			let used = chat.usage()
+			assert used.inputTokens == 70 && used.cachedTokens == 40 && used.thinkingTokens == 25
+
+			let first = sent.bodies[0]
+			assert "{first["instructions"]}" == "Be brief." && "{first["max_output_tokens"]}" == "200" && "{first["store"]}" == "false"
+			let reasoning = first["reasoning"]
+			fail "no reasoning" unless reasoning is map<string, any>
+			assert "{reasoning["effort"]}" == "low" && "{reasoning["summary"]}" == "auto"
+			assert sent.headers[0] == "Bearer sk-test|org-1"
+			// The second request carries the reasoning item, the call and
+			// its output, in order.
+			let input = sent.bodies[1]["input"]
+			fail "no input" unless input is any[]
+			let kinds string[]
+			for let (_, item) in input {
+				kinds.push(item.get("type") is none ?? ("{item["role"]}", "{item["type"]}")) when item is map<string, any>
+			}
+			assert kinds.join(",") == "user,reasoning,function_call,function_call_output"
+			let carried = input[1]
+			fail "no reasoning item" unless carried is map<string, any>
+			assert "{carried["encrypted_content"]}" == "gAAA"
+
+			// An uploaded file named in a message.
+			let reading = ai.chat()
+			try reading.ask(Message{text: "Summarise it.", files: [llm.RemoteFile{id: "file-7", mediaType: "application/pdf"}]})
+			reading.reset()
+			let sentInput = (new JSON()).encode(sent.bodies[sent.bodies.len() - 1]["input"])
+			assert string(sentInput).contains("\"type\":\"input_file\",\"file_id\":\"file-7\"")
+
+			// What the API cannot take fails before a request.
+			let stops = ai.chat()
+			stops.stopAt = ["END"]
+			assert failure(def () !none {
+				try stops.say("hi")
+				return none
+			}).kind == RemoteErrorKind.BadRequest
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestChatCompletionsApi() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(model = "qwen", apiKey = "k", baseURL = "http://{server.address().str()}/v1/")
+			assert !ai.usesResponses()
+			// The provider side alone: the events of one reply.
+			let stream = try ai.reply(llm.ChatRequest{model: "qwen", messages: [Message{role: Role.User, text: "Coat?"}], limit: 10})
+			let kinds string[]
+			for {
+				let event = try stream.next()
+				break when event is none
+				kinds.push("{event.kind}")
+			}
+			assert kinds.join(",") == "Thinking,Call,Done"
+			let chat = ai.chat()
+			chat.limit = 50
+			chat.seed = 7
+			chat.stopAt = ["\n\n"]
+			chat.useTool(new OpenDesk())
+			let shown = try chat.say("Coat in Oslo?")
+			assert shown == "Take a coat."
+			let all = chat.messages()
+			assert all.len() == 4 && all[1].thinking == "Use the tool." && all[1].calls[0].arguments == "\{\"city\":\"Oslo\"}" && all[2].text == "Oslo: 12 degrees and rain"
+			let used = chat.usage()
+			assert used.inputTokens == 50 && used.outputTokens == 16 && used.cachedTokens == 32 && used.thinkingTokens == 5
+			let first = sent.bodies[1]
+			assert "{first["max_tokens"]}" == "50" && "{first["seed"]}" == "7" && first.get("max_completion_tokens") is none
+			let messages = sent.bodies[2]["messages"]
+			fail "no messages" unless messages is any[]
+			let tool = messages[2]
+			fail "no tool message" unless tool is map<string, any>
+			assert "{tool["role"]}" == "tool" && "{tool["tool_call_id"]}" == "call_a"
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestErrors() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(apiKey = "bad", baseURL = "http://{server.address().str()}/v1")
+			ai.api = Api.Responses
+			let denied = failure(def () !none {
+				try ai.chat("secret").say("hi")
+				return none
+			})
+			assert denied.kind == RemoteErrorKind.Auth && denied.status == 401 && denied.remoteCode == "invalid_api_key" && denied.requestId == "req_123" && denied.message.contains("Incorrect API key")
+			let broke = failure(def () !none {
+				try ai.chat("breaks").say("hi")
+				return none
+			})
+			assert broke.kind == RemoteErrorKind.Server && broke.remoteCode == "server_error"
+			let missing = failure(def () !none {
+				try ai.files.delete("gone")
+				return none
+			})
+			assert missing.kind == RemoteErrorKind.NotFound
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestEndpoints() !none {
+			let sent = new Sent()
+			let server = try openaiServer(sent)
+			let ai = new Client(apiKey = "k", baseURL = "http://{server.address().str()}/v1")
+			let embedder Embedder = ai.embedder("text-embedding-3-small", dimensions = 2)
+			let vectors = try embedder.embed(string["a", "b"])
+			assert vectors.len() == 2 && vectors[0][0] == float32(1) && vectors[1][1] == float32(2)
+			assert "{sent.bodies[0]["dimensions"]}" == "2"
+
+			assert (try ai.modelInfo("gpt-5")).owner == "openai"
+			let models = try ai.models()
+			assert models.len() == 3 && models[2].id == "m3" && !(models[2].created is none)
+
+			let edited = try ai.images.edit([new Image(2, 2), new Image(2, 2)], "add a hat", mask = new Image(2, 2))
+			assert edited.len() == 1
+			let editForm = sent.forms[sent.forms.len() - 1]
+			assert editForm.contains("name=\"image[]\"") && editForm.contains("name=\"mask\"") && editForm.contains("add a hat")
+			assert (try ai.images.vary(new Image(1, 1), count = 2)).len() == 2
+			assert sent.forms[sent.forms.len() - 1].contains("dall-e-2")
+			let pictures = try ai.images.generate("a kettle", size = ImageSize.Square)
+			assert pictures.len() == 1 && pictures[0].size().width == uint(3)
+			let last = sent.bodies[sent.bodies.len() - 1]
+			assert "{last["size"]}" == "1024x1024" && last.get("response_format") is none
+
+			let sound = new Audio()
+			sound.info = AudioInfo{sampleRate: 16000, channels: 1}
+			sound.samples = float32[0.0, 0.1, 0.2]
+			let heard = try ai.audio.transcribe(sound, timestamps = true)
+			assert heard.text == "hello there" && heard.segments.len() == 1 && heard.length == 1500ms
+			let form = sent.forms[sent.forms.len() - 1]
+			assert form.contains("name=\"response_format\"") && form.contains("verbose_json") && form.contains("filename=\"sound.wav\"") && form.contains("RIFF")
+			assert (try ai.audio.translate(sound)) == "good morning"
+			let spoken = try ai.audio.speak("Hi", voice = Voice.Coral)
+			assert spoken.samples.len() == 4 && int(spoken.info.sampleRate) == 24000
+
+			let file = try ai.files.upload("\{\"custom_id\":\"1\"}".bytes(), "requests.jsonl", Purpose.Batch)
+			assert file.id == "file-1" && file.purpose == "batch"
+			assert sent.forms[sent.forms.len() - 1].contains("name=\"purpose\"")
+			assert string(try ai.files.content("file-1")).startsWith("\{\"custom_id\"")
+			assert (try ai.files.list(purpose = Purpose.Batch))[0].purpose == "batch"
+			try ai.files.delete("file-1")
+
+			let store = try ai.vectorStores.create("docs", files = ["file-1"], expiresAfter = 7)
+			assert store.id == "vs_1" && store.files.inProgress == 1
+			assert (try ai.vectorStores.list())[0].name == "docs"
+			assert (try ai.vectorStores.rename("vs_1", "papers")).name == "papers"
+			assert (try ai.vectorStores.add("vs_1", "file-1")).status == "in_progress"
+			try ai.vectorStores.removeFile("vs_1", "file-1")
+			assert sent.paths.indexOf("/v1/vector_stores/vs_1/files/file-1") >= 0
+			let hits = try ai.vectorStores.search("vs_1", "kettle", limit = 3)
+			assert hits.len() == 1 && hits[0].text == "Kettles boil." && hits[0].score > 0.8
+
+			let batch = try ai.batches.create("file-1")
+			assert batch.id == "batch_1" && batch.status == "validating"
+			assert (try ai.batches.list())[0].outputFileId == "file-2"
+			let cancelled = try ai.batches.cancel("batch_1")
+			assert cancelled.status == "cancelling" && cancelled.requests.completed == 1
+			try server.close()
+			return none
+		}
+
+		// With ADM_TEST_OPENAI_KEY or ADM_TEST_OPENAI_URL: both
+		// conversation APIs, a tool call, embeddings and the model list from
+		// the real thing.
+		@test()
+		def TestLiveServer() !none {
+			return none when liveURL.len() == 0 && liveKey.len() == 0
+			// OpenAI with a key alone; a compatible server with its URL.
+			let onOpenai = liveURL.len() == 0
+			let model = liveModel.len() > 0 ?? (liveModel, onOpenai ?? ("gpt-5-mini", "qwen3:0.6b"))
+			let ai = new Client(model = model, apiKey = liveKey.len() > 0 ?? (liveKey, "none"), baseURL = onOpenai ?? (openaiURL, liveURL))
+			for let (_, api) in Api[Api.ChatCompletions, Api.Responses] {
+				ai.api = api
+				let chat = ai.chat()
+				chat.limit = 400
+				let answer = try chat.say("What is 2 + 3? Reply with the number only.")
+				fail "{api}: {answer}" unless answer.contains("5")
+				assert chat.usage().outputTokens > 0
+				let tools = ai.chat()
+				tools.limit = 400
+				tools.useTool(new OpenDesk())
+				try tools.say("What is the weather in Oslo? Use the tool.")
+				let all = tools.messages()
+				fail "{api}: no call" unless all.len() >= 4 && all[1].calls.len() >= 1 && all[1].calls[0].name == "weather" && all[2].role == Role.Tool
+			}
+			let booking = LiveBooking{}
+			try ai.chat().fill(booking, "Extract the guest's name and the number of nights from this text: Ada Lovelace stays three nights.")
+			fail "filled {booking.guest} {booking.nights}" unless booking.guest.contains("Ada") && booking.nights == 3
+			let vectors = try ai.embedder(liveEmbed.len() > 0 ?? (liveEmbed, onOpenai ?? ("text-embedding-3-small", "all-minilm"))).embed(string["a cat", "a dog"])
+			assert vectors.len() == 2 && vectors[0].len() > 0
+			assert (try ai.models()).len() > 0
+			return none
+		}
+	}
+}

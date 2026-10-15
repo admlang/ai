@@ -1,0 +1,229 @@
+partial module adm.ai.openai {
+	use (
+		std.net.http
+		std.data.encoding::(Base64)
+		std.formats.image
+		std.formats.image::(Image)
+		std.formats.audio
+		std.formats.audio::(Audio)
+		std.ai.llm::(RemoteError, RemoteErrorKind)
+	)
+
+	// The size of generated pictures. Auto, square, portrait and landscape
+	// are the GPT image models'; the others DALL·E's.
+	enum ImageSize {
+		Auto      = "auto",
+		Square    = "1024x1024",
+		Portrait  = "1024x1536",
+		Landscape = "1536x1024",
+		Small     = "256x256",
+		Medium    = "512x512",
+		Wide      = "1792x1024",
+		Tall      = "1024x1792",
+	}
+
+	// How carefully a picture is drawn. Standard and HD are DALL·E 3's.
+	enum ImageQuality {
+		Auto     = "auto",
+		Low      = "low",
+		Medium   = "medium",
+		High     = "high",
+		Standard = "standard",
+		HD       = "hd",
+	}
+
+	// Whether a generated picture's background is transparent (GPT image
+	// models, PNG and WebP).
+	enum Background {
+		Auto        = "auto",
+		Transparent = "transparent",
+		Opaque      = "opaque",
+	}
+
+	// The voices of speech synthesis.
+	enum Voice {
+		Alloy   = "alloy",
+		Ash     = "ash",
+		Ballad  = "ballad",
+		Cedar   = "cedar",
+		Coral   = "coral",
+		Echo    = "echo",
+		Fable   = "fable",
+		Marin   = "marin",
+		Nova    = "nova",
+		Onyx    = "onyx",
+		Sage    = "sage",
+		Shimmer = "shimmer",
+		Verse   = "verse",
+	}
+
+	// A piece of a transcript with its place in the recording.
+	struct TranscriptSegment {
+		start duration
+		end   duration
+		text  string
+	}
+
+	// What `transcribe` heard.
+	struct Transcript {
+		text     string
+		// The language heard ("english"); "" when the model does not say.
+		language string
+		// The recording's length; 0 when the model does not say.
+		length   duration
+		// With `timestamps`: the text in pieces with their times.
+		segments TranscriptSegment[]
+	}
+
+	// The picture endpoints of a client (`ai.images`).
+	type Images {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Draws `count` pictures of `prompt` with `model` ("gpt-image-1",
+		// "dall-e-3").
+		// Fails with RemoteError when the API refuses the prompt
+		// (ContentFiltered for the moderation's refusals) or a setting.
+		def generate(prompt string, model string = "gpt-image-1", count int = 1, size ImageSize = ImageSize.Auto, quality ImageQuality = ImageQuality.Auto, background Background = Background.Auto) !Image[] {
+			let body = map<string, any>{"model": model, "prompt": prompt, "n": count}
+			body.set("size", size.value) unless size == ImageSize.Auto
+			body.set("quality", quality.value) unless quality == ImageQuality.Auto
+			body.set("background", background.value) unless background == Background.Auto
+			body.set("response_format", "b64_json") when model.startsWith("dall-e")
+			return try picturesOf(try objectOf(try post(client, "/images/generations", body)))
+		}
+
+		// Changes `pictures` (one or more, the first edited) as `prompt`
+		// says, within the transparent part of `mask` when given.
+		// Fails like `generate`.
+		def edit(pictures Image[], prompt string, mask ?Image = none, model string = "gpt-image-1", count int = 1, size ImageSize = ImageSize.Auto, quality ImageQuality = ImageQuality.Auto, background Background = Background.Auto) !Image[] {
+			let form = new Form()
+			try form.field("model", model)
+			try form.field("prompt", prompt)
+			try form.field("n", "{count}")
+			try form.field("size", size.value) unless size == ImageSize.Auto
+			try form.field("quality", quality.value) unless quality == ImageQuality.Auto
+			try form.field("background", background.value) unless background == Background.Auto
+			try form.field("response_format", "b64_json") when model.startsWith("dall-e")
+			for let (k, picture) in pictures {
+				try form.file(pictures.len() > 1 ?? ("image[]", "image"), "image-{k}.png", try pngOf(picture), "image/png")
+			}
+			let cover = mask
+			try form.file("mask", "mask.png", try pngOf(cover), "image/png") unless cover is none
+			return try picturesOf(try objectOf(try postForm(client, "/images/edits", form)))
+		}
+
+		// `count` variations of `picture` (DALL·E 2).
+		// Fails like `generate`.
+		def vary(picture Image, count int = 1, size ImageSize = ImageSize.Square) !Image[] {
+			let form = new Form()
+			try form.field("model", "dall-e-2")
+			try form.field("n", "{count}")
+			try form.field("size", size.value)
+			try form.field("response_format", "b64_json")
+			try form.file("image", "image.png", try pngOf(picture), "image/png")
+			return try picturesOf(try objectOf(try postForm(client, "/images/variations", form)))
+		}
+	}
+
+	// The pictures of an images reply, decoded.
+	internal def picturesOf(reply map<string, any>) !Image[] {
+		let out Image[]
+		let codec = new Base64()
+		for let (_, item) in listAt(reply, "data") {
+			continue unless item is map<string, any>
+			let encoded = textAt(item, "b64_json")
+			fail RemoteError{message: "openai: a picture came without its data", code: "protocol", kind: RemoteErrorKind.Protocol} when encoded.len() == 0
+			out.push(try image.load(try codec.decode(encoded)))
+		}
+		return out
+	}
+
+	// The sound endpoints of a client (`ai.audio`).
+	type Sounds {
+		internal client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// What is said in `sound`, by `model` ("gpt-4o-transcribe",
+		// "gpt-4o-mini-transcribe", "whisper-1"). `language` (ISO 639-1)
+		// and `prompt` (words to expect, earlier text) help the model;
+		// `timestamps` asks for segments with their times (whisper-1).
+		// Fails with RemoteError when the API refuses the sound.
+		def transcribe(sound Audio, model string = "gpt-4o-mini-transcribe", language string = "", prompt string = "", timestamps bool = false) !Transcript {
+			let form = new Form()
+			try form.field("model", model)
+			try form.field("language", language) when language.len() > 0
+			try form.field("prompt", prompt) when prompt.len() > 0
+			try form.field("response_format", timestamps ?? ("verbose_json", "json"))
+			try form.field("timestamp_granularities[]", "segment") when timestamps
+			try form.file("file", "sound.wav", try wavOf(sound), "audio/wav")
+			let reply = try objectOf(try postForm(client, "/audio/transcriptions", form))
+			let out = Transcript{text: textAt(reply, "text"), language: textAt(reply, "language"), length: secondsOf(reply.get("duration"))}
+			for let (_, s) in listAt(reply, "segments") {
+				continue unless s is map<string, any>
+				out.segments.push(TranscriptSegment{start: secondsOf(s.get("start")), end: secondsOf(s.get("end")), text: textAt(s, "text")})
+			}
+			return out
+		}
+
+		// What is said in `sound`, in English (whisper-1).
+		// Fails like `transcribe`.
+		def translate(sound Audio, prompt string = "", model string = "whisper-1") !string {
+			let form = new Form()
+			try form.field("model", model)
+			try form.field("prompt", prompt) when prompt.len() > 0
+			try form.field("response_format", "json")
+			try form.file("file", "sound.wav", try wavOf(sound), "audio/wav")
+			return textAt(try objectOf(try postForm(client, "/audio/translations", form)), "text")
+		}
+
+		// `text` said by `voice`, `instructions` setting the tone
+		// (gpt-4o-mini-tts), `speed` from 0.25 to 4.
+		// Fails with RemoteError when the API refuses the text.
+		def speak(text string, voice Voice = Voice.Alloy, model string = "gpt-4o-mini-tts", instructions string = "", speed float = 1.0) !Audio {
+			let body = map<string, any>{"model": model, "input": text, "voice": voice.value, "response_format": "wav"}
+			body.set("instructions", instructions) when instructions.len() > 0
+			body.set("speed", speed) when speed != 1.0
+			let res = try post(client, "/audio/speech", body)
+			let data = try res.bytes()
+			return audio.load(data) onerror (err error) {
+				fail RemoteError{message: "openai: the speech is not a WAV file: {err.message}", code: "protocol", cause: err, kind: RemoteErrorKind.Protocol}
+			}
+		}
+	}
+
+	// Seconds as a JSON number, as a duration.
+	internal def secondsOf(v ?any) duration {
+		return 0s when v is none
+		match v {
+			case float:
+				return duration(int(v * 1e9))
+			case int:
+				return duration(v * 1000000000)
+			default:
+				return 0s
+		}
+	}
+
+	partial type Client {
+		// The picture endpoints: generate, edit, vary.
+		images Images {
+			def get() Images {
+				return new Images(self)
+			}
+		}
+
+		// The sound endpoints: transcribe, translate, speak.
+		audio Sounds {
+			def get() Sounds {
+				return new Sounds(self)
+			}
+		}
+	}
+}
